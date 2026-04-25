@@ -4,6 +4,7 @@
 // Distributed under terms of the GPLv3 license.
 //
 use crate::beamer::get_frames;
+use crate::fs_utils::{cache_path, publish_file};
 use crate::parsing;
 
 use log::Level::Trace;
@@ -14,8 +15,9 @@ use indicatif::ProgressBar;
 use rayon::prelude::*;
 use regex::Regex;
 use std::env::current_dir;
+use std::io::ErrorKind;
 use std::fs::write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::str;
 use std::sync::Mutex;
@@ -45,10 +47,6 @@ lazy_static! {
 }
 
 fn show_error_slide(cachedir: &Path, output_file: &str) {
-    if Path::new(&output_file).is_file() {
-        let _result = ::std::fs::remove_file(&output_file);
-    }
-
     let error_frame = String::from_utf8_lossy(include_bytes!("error.tex")).to_owned();
     let error_file = cachedir.join("error.tex");
     let error_pdf = cachedir.join("error.pdf");
@@ -61,19 +59,42 @@ fn show_error_slide(cachedir: &Path, output_file: &str) {
         compiler.working_dir = cachedir.to_owned();
 
         let _result = compiler.run(
-            &error_file.canonicalize().unwrap().to_string_lossy(),
+            tex_input_name(&error_file),
             &LatexInput::new(),
             LatexRunOptions::new(),
         );
     }
     if error_pdf.exists() {
-        if Path::new(&output_file).is_file() {
-            let _result = ::std::fs::remove_file(&output_file);
+        if let Err(err) = publish_file(&error_pdf, Path::new(output_file)) {
+            error!("Failed to publish error slide: {}", err);
         }
-
-        ::symlink::symlink_file(error_pdf, output_file)
-            .expect("Failed to create symlink to error file.");
     }
+}
+
+fn log_command_error(command: &str, context: &str, err: &std::io::Error) {
+    if err.kind() == ErrorKind::NotFound {
+        error!("Failed to {}: {} was not found on PATH.", context, command);
+    } else {
+        error!("Failed to {}: {}", context, err);
+    }
+}
+
+fn publish_output_file(compiled_pdf: &Path, output_file: &str) -> Result<()> {
+    info!("Publishing: {:?} -> {:?}", compiled_pdf, output_file);
+    publish_file(compiled_pdf, Path::new(output_file)).map_err(|err| {
+        error!("{}", err);
+        FasterBeamerError::IoError
+    })
+}
+
+fn tex_input_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .expect("Expected a TeX input file name")
+}
+
+fn default_output_file(input_path: &Path) -> String {
+    input_path.with_extension("pdf").to_string_lossy().into_owned()
 }
 
 pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
@@ -84,7 +105,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .unwrap_or(&cwd)
         .canonicalize()
         .unwrap_or_else(|_| cwd.to_owned());
-    let output_file = args.value_of("OUTPUT").unwrap_or("output.pdf");
+    let output_file = args
+        .value_of("OUTPUT")
+        .map(|output| output.to_owned())
+        .unwrap_or_else(|| default_output_file(input_path));
     let correct_frame_numbers = args.is_present("frame-numbers");
 
     if !input_path.is_file() {
@@ -163,13 +187,15 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         FasterBeamerError::IoError
     })?;
 
-    let cache_subdir = cachedir.join(format!(
-        "./{}",
-        &input_dir
-            .to_str()
-            .unwrap() // append input to cachedir
-            .replace(":", "_") // Escape forbidden characters like ..cache_dir/c:/
-    ));
+    let cache_subdir = cache_path(&cachedir, &input_dir);
+    std::fs::create_dir_all(&cache_subdir).map_err(|ref err| {
+        error!(
+            "Failed to create cache subdir \"{}\": {}",
+            cache_subdir.display(),
+            err
+        );
+        FasterBeamerError::IoError
+    })?;
 
     let preamble_hash = md5::compute(&preamble);
     let preamble_filename = format!("{:x}_{}", preamble_hash, args.is_present("draft"));
@@ -188,15 +214,16 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         let output = Command::new("pdflatex")
             .arg("-shell-escape")
             .arg("-ini")
-            .arg(format!("-jobname=\"{}\"", preamble_filename))
-            .arg("\"&pdflatex\"")
+            .arg(format!("-jobname={}", preamble_filename))
+            .arg("&pdflatex")
             .arg("mylatexformat.ltx")
-            .arg(&input_file)
+            .arg(tex_input_name(input_path))
+            .current_dir(&input_dir)
             .output();
         match output {
             Err(e) => {
-                error!("Failed to compile preamble!\n{}", e);
-                show_error_slide(&cachedir, output_file);
+                log_command_error("pdflatex", "compile the preamble", &e);
+                show_error_slide(&cachedir, &output_file);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
                 return Err(FasterBeamerError::CompileError);
@@ -206,7 +233,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     "Failed to compile preamble! {}",
                     str::from_utf8(&output.stderr).unwrap()
                 );
-                show_error_slide(&cachedir, output_file);
+                show_error_slide(&cachedir, &output_file);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
                 return Err(FasterBeamerError::CompileError);
@@ -216,7 +243,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     }
 
     let mut generated_documents = Vec::new();
-    let mut command = &mut Command::new("pdfunite");
+    let mut command = Command::new("pdfunite");
     for (frame_idx, f) in frames.iter().enumerate() {
         let frame_idx_str = if correct_frame_numbers {
             format!("{}", frame_idx)
@@ -236,7 +263,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         let output = cache_subdir.join(format!("{:x}.pdf", hash));
         generated_documents.push((hash, compile_string));
 
-        command = command.arg(output.to_str().unwrap());
+        command.arg(&output);
     }
 
     trace!("Comparing frames");
@@ -266,11 +293,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             if pdf.is_file() {
                 trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
             } else {
-                let latex_input = LatexInput::from_lazy(
-                    input_dir.canonicalize().unwrap().to_str().unwrap(),
-                    &cachedir,
-                )
-                .expect("Failed to create LatexInput");
+                let latex_input = LatexInput::from_lazy(&input_dir, &cachedir)
+                    .expect("Failed to create LatexInput");
 
                 let temp_file = cache_subdir.join(format!("{:x}.tex", hash));
 
@@ -282,7 +306,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     compiler.working_dir = temp_file.parent().unwrap().canonicalize().unwrap();
 
                     let result = compiler.run(
-                        &temp_file.canonicalize().unwrap().to_string_lossy(),
+                        tex_input_name(&temp_file),
                         &latex_input,
                         LatexRunOptions::new(),
                     );
@@ -304,12 +328,18 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     progress_bar.finish_and_clear();
 
     if args.is_present("pdfunite") {
-        let output = command.arg(output_file).output();
+        let output = command.arg(&output_file).output();
 
         match output {
             Err(e) => {
-                error!("Failed to run pdf unite!\n{}", e);
-                show_error_slide(&cachedir, output_file);
+                if e.kind() == ErrorKind::NotFound {
+                    error!(
+                        "Failed to run pdfunite: pdfunite was not found on PATH. Install it or use --unite instead."
+                    );
+                } else {
+                    error!("Failed to run pdf unite!\n{}", e);
+                }
+                show_error_slide(&cachedir, &output_file);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::PdfUniteError);
@@ -319,7 +349,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     "Failed to run pdfunite! {}",
                     str::from_utf8(&output.stderr).unwrap()
                 );
-                show_error_slide(&cachedir, output_file);
+                show_error_slide(&cachedir, &output_file);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::PdfUniteError);
@@ -328,10 +358,6 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         };
     } else if args.is_present("unite") {
         info!("Pasting precompiled frames into original document!");
-        if Path::new(&output_file).is_file() {
-            let _result =
-                ::std::fs::remove_file(&output_file).expect("Tried to delete previous output file");
-        }
 
         let mut united_tex = format!(
             "{}\n{}",
@@ -357,7 +383,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             compiler.working_dir = cache_subdir;
 
             let compile_result = compiler.run(
-                &united_tex_file.canonicalize().unwrap().to_string_lossy(),
+                tex_input_name(&united_tex_file),
                 &LatexInput::new(),
                 LatexRunOptions::new(),
             );
@@ -369,17 +395,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 );
             }
 
-            if Path::new(&output_file).is_file() {
-                let _result = ::std::fs::remove_file(&output_file)
-                    .expect("Tried to delete previous output file");
-            }
             if Path::new(&united_pdf).is_file() {
-                info!("Linking: {:?} -> {:?}", &united_pdf, &output_file);
-                ::symlink::symlink_file(united_pdf, output_file)
-                    .expect("Failed to create symlink to output file.");
+                publish_output_file(&united_pdf, &output_file)?;
             } else {
                 error!("Compilation failed!");
-                show_error_slide(&cachedir, output_file);
+                show_error_slide(&cachedir, &output_file);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::CompileError);
@@ -396,17 +416,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             let (hash, _) = generated_documents[first_changed_frame];
             let compiled_pdf = cache_subdir.join(format!("{:x}.pdf", hash));
 
-            if Path::new(&output_file).is_file() {
-                let _result = ::std::fs::remove_file(&output_file)
-                    .expect("Tried to delete previous output file");
-            }
             if Path::new(&compiled_pdf).is_file() {
-                info!("Linking: {:?} -> {:?}", &compiled_pdf, &output_file);
-                ::symlink::symlink_file(compiled_pdf, output_file)
-                    .expect("Failed to create symlink to output file.");
+                publish_output_file(&compiled_pdf, &output_file)?;
             } else {
                 error!("Compilation failed!");
-                show_error_slide(&cachedir, output_file);
+                show_error_slide(&cachedir, &output_file);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::CompileError);

@@ -49,6 +49,7 @@
 //! ```
 //!
 
+use crate::fs_utils::{stage_directory_into, stage_file_into};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -149,47 +150,20 @@ impl LatexInput {
 
     pub fn add_file_lazy(&mut self, file: PathBuf, dest_path: &Path) -> Result<()> {
         if file.is_file() {
-            let dest_file = dest_path.join(format!(
-                "./{}",
-                &file
-                    .to_str()
-                    .unwrap() // append input to cachedir
-                    .replace(":", "_") // Escape forbidden characters like ..cache_dir/c:/
-            ));
-            if !&dest_file.exists() {
-                match &dest_file.parent() {
-                    Some(p) => fs::create_dir_all(p).map_err(LatexError::Io)?,
-                    None => (),
-                }
-                let _result = ::symlink::symlink_file(file, dest_file);
-            }
+            stage_file_into(dest_path, &file).map_err(LatexError::Io)?;
         }
         Ok(())
     }
 
     pub fn add_folder_lazy(&mut self, folder: PathBuf, dest_path: &Path) -> Result<()> {
         if folder.is_dir() {
-            let dest_folder = dest_path.join(format!(
-                "./{}",
-                &folder
-                    .to_str()
-                    .unwrap() // append input to cachedir
-                    .replace(":", "_") // Escape forbidden characters like ..cache_dir/c:/
-            ));
-            if !&dest_folder.exists() {
-                match &dest_folder.parent() {
-                    Some(p) => fs::create_dir_all(p).map_err(LatexError::Io)?,
-                    None => (),
-                }
-                let _result = ::symlink::symlink_dir(folder, dest_folder);
-            }
+            stage_directory_into(dest_path, &folder).map_err(LatexError::Io)?;
         }
         Ok(())
     }
 
-    pub fn from_lazy(s: &str, dest_path: &Path) -> Result<LatexInput> {
+    pub fn from_lazy(path: &Path, dest_path: &Path) -> Result<LatexInput> {
         let mut input = LatexInput::new();
-        let path = PathBuf::from(s);
         let paths = fs::read_dir(path).map_err(LatexError::Input)?;
 
         for path in paths {

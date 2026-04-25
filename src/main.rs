@@ -6,6 +6,7 @@ extern crate lazy_static;
 extern crate failure_derive;
 
 mod beamer;
+mod fs_utils;
 mod latexcompile;
 mod parsing;
 mod process_file;
@@ -28,14 +29,14 @@ fn main() {
     }
 
     let matches = App::new("faster-beamer")
-        .version("0.1.6")
+        .version(env!("CARGO_PKG_VERSION"))
         .author("Stephan Seitz <stephan.seitz@fau.de>")
         .about("Incremental compiler for Beamer LaTeX presentations")
         .arg(
             Arg::with_name("watch")
                 .short("w")
                 .long("watch")
-                .help("Sets a custom config file"),
+                .help("Watch the input file and rebuild on changes"),
         )
         .arg(
             Arg::with_name("INPUT")
@@ -53,7 +54,7 @@ fn main() {
             Arg::with_name("pdfunite")
                 .short("x")
                 .long("pdfunite")
-                .help("Unites all slides to a PDF using pdfunite"),
+                .help("Unites all slides to a PDF using the optional pdfunite executable"),
         )
         .arg(
             Arg::with_name("frame-numbers")
@@ -69,7 +70,7 @@ fn main() {
         )
         .arg(
             Arg::with_name("OUTPUT")
-                .help("Filename for output PDF")
+                .help("Filename for output PDF (defaults to INPUT with a .pdf extension)")
                 .index(2),
         )
         //.arg(

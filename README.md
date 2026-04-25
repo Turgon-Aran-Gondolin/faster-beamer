@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.org/theHamsta/faster-beamer.svg?branch=master)](https://travis-ci.org/theHamsta/faster-beamer)
+[![CI](https://github.com/theHamsta/faster-beamer/actions/workflows/ci.yml/badge.svg)](https://github.com/theHamsta/faster-beamer/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/faster-beamer.svg)](https://crates.io/crates/faster-beamer)
 
 # faster-beamer
@@ -21,26 +21,36 @@ Executing the following line will let `faster-beamer` watch your tex-file for ch
 the frame that was changed most recently.
 
 ```bash
-faster-beamer presentation.tex --server
+faster-beamer presentation.tex --watch
 ```
 
 If you want pdfunite to glue all the compiled frames together use:
 
 ```bash
-faster-beamer presentation.tex --server --pdfunite
+faster-beamer presentation.tex --watch --pdfunite
 ```
 
 We can also try to reinsert the precompiled frames into the orginal document. 
 This will yield the most accurate result (including title, section pages). 
 
 ```bash
-faster-beamer presentation.tex --server --unite
+faster-beamer presentation.tex --watch --unite
 ```
 
 ## Requirements
 
- - A Rust toolchain >= 3.39
- - You need to have `pdflatex` in `PATH`. Addidionally, also `pdfunite` if you want to unite PDFs.
+- A Rust toolchain >= 3.39
+- A working `pdflatex` on `PATH`
+- `pdfunite` on `PATH` only if you want to use `--pdfunite`
+
+## Windows notes
+
+- The first supported Windows target is `x86_64-pc-windows-msvc`.
+- Use TeX Live on Windows for the initial support path.
+- Install the MSVC Rust toolchain and the Visual C++ Build Tools needed to compile the vendored parser sources.
+- `--unite` is the more portable full-document mode on Windows.
+- `--pdfunite` remains optional and will fail with an actionable error if `pdfunite` is not installed.
+- If a PDF viewer keeps the output file locked, `faster-beamer` now reports that publish failure instead of relying on symlink replacement.
 
 ## Installation
 
