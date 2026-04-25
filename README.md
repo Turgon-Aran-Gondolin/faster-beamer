@@ -12,7 +12,7 @@ I wanted to have a fast preview of my files even if the output is not 100% corre
 
 ## What it does
 
-It parses your input file and compiles each `frame` enviroment individually and in parallel.
+It parses your input file and compiles each `frame` enviroment individually.
 Compiled frames are cached and only recompiled if necessary.  
 Of course, frame pages and citation will not be rendered correctly, but it should be sufficient to get an idea
 how your frames will look like.
@@ -60,6 +60,13 @@ If you suspect the cache contains stale or wrong frame PDFs, force a full rebuil
 ```bash
 faster-beamer presentation.tex --watch --force-recompile
 faster-beamer presentation.tex --watch -r
+```
+
+If you want to compile independent frame PDFs concurrently, enable parallelization with `--parallel` or `-p`:
+
+```bash
+faster-beamer presentation.tex --watch --parallel
+faster-beamer presentation.tex --watch -p
 ```
 
 ## Requirements

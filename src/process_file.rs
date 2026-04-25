@@ -137,6 +137,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let bibliography = bibliography_tool(args);
     let run_options = latex_run_options(latex_pass_count, bibliography);
     let force_recompile = args.is_present("force-recompile");
+    let use_parallel = args.is_present("parallel");
 
     if !input_path.is_file() {
         error!("Could not open {}", input_file);
@@ -310,19 +311,14 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     );
 
     let progress_bar = ProgressBar::new(generated_documents.len() as u64);
+    let latex_input = LatexInput::new();
 
-    generated_documents
-        .par_iter()
-        .enumerate()
-        .for_each(|(frame_idx, (hash, tex_content))| {
+    let compile_document = |frame_idx: usize, (hash, tex_content): &(md5::Digest, String)| {
             let pdf = cache_subdir.join(format!("{:x}.pdf", hash));
 
             if pdf.is_file() && !force_recompile {
                 trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
             } else {
-                let latex_input = LatexInput::from_lazy(&input_dir, &cachedir)
-                    .expect("Failed to create LatexInput");
-
                 let temp_file = input_dir.join(format!("{:x}.tex", hash));
 
                 if write(&temp_file, &tex_content).is_ok() {
@@ -355,7 +351,19 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 }
             };
             progress_bar.inc(1);
-        });
+        };
+
+    if use_parallel {
+        generated_documents
+            .par_iter()
+            .enumerate()
+            .for_each(|(frame_idx, document)| compile_document(frame_idx, document));
+    } else {
+        generated_documents
+            .iter()
+            .enumerate()
+            .for_each(|(frame_idx, document)| compile_document(frame_idx, document));
+    }
     progress_bar.finish_and_clear();
 
     if args.is_present("pdfunite") {

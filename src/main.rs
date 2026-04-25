@@ -99,6 +99,12 @@ fn main() {
                 .help("Ignore cached frame PDFs and rebuild them from scratch"),
         )
         .arg(
+            Arg::with_name("parallel")
+                .short("p")
+                .long("parallel")
+                .help("Compile independent frame PDFs in parallel"),
+        )
+        .arg(
             Arg::with_name("OUTPUT")
                 .help("Filename for output PDF (defaults to INPUT with a .pdf extension)")
                 .index(2),
