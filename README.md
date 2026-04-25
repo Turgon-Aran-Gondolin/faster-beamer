@@ -3,7 +3,7 @@
 
 # faster-beamer
 
-An incremental compiler for LaTeX Beamer slides
+An incremental compiler for LaTeX Beamer slides, with parallel compilation. 
 
 ## Motivation
 

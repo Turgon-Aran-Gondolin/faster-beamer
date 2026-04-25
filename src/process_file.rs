@@ -53,11 +53,9 @@ fn show_error_slide(cachedir: &Path, output_file: &str) {
     let error_pdf = cachedir.join("error.pdf");
 
     if !error_pdf.exists() && write(&error_file, &error_frame[..]).is_ok() {
-        let mut compiler = LatexCompiler::new()
-            .unwrap()
+        let compiler = LatexCompiler::new_in(cachedir.to_owned())
             .add_arg("-shell-escape")
             .add_arg("-interaction=nonstopmode");
-        compiler.working_dir = cachedir.to_owned();
 
         let _result = compiler.run(
             &error_file,
@@ -322,12 +320,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 let temp_file = input_dir.join(format!("{:x}.tex", hash));
 
                 if write(&temp_file, &tex_content).is_ok() {
-                    let mut compiler = LatexCompiler::new()
-                        .unwrap()
+                    let compiler = LatexCompiler::new_in(cache_subdir.clone())
                         .add_arg("-shell-escape")
-                        .add_arg("-interaction=nonstopmode");
-                    compiler.working_dir = cache_subdir.clone();
-                    compiler.current_dir = Some(input_dir.clone());
+                        .add_arg("-interaction=nonstopmode")
+                        .with_current_dir(input_dir.clone());
 
                     let result = compiler.run(
                         Path::new(tex_input_name(&temp_file)),
@@ -418,12 +414,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         let united_pdf = cache_subdir.join("faster-beamer-united.pdf");
         let write_result = write(&united_tex_file, united_tex);
         if write_result.is_ok() {
-            let mut compiler = LatexCompiler::new()
-                .unwrap()
+            let compiler = LatexCompiler::new_in(cache_subdir)
                 .add_arg("-shell-escape")
-                .add_arg("-interaction=nonstopmode");
-            compiler.working_dir = cache_subdir;
-            compiler.current_dir = Some(input_dir.clone());
+                .add_arg("-interaction=nonstopmode")
+                .with_current_dir(input_dir.clone());
 
             let compile_result = compiler.run(
                 Path::new(tex_input_name(&united_tex_file)),

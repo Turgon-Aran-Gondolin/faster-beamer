@@ -251,13 +251,22 @@ impl LatexCompiler {
     /// Create a new latex compiler wrapper
     pub fn new() -> Result<LatexCompiler> {
         let dir = tempdir().map_err(LatexError::Io)?;
+        Ok(Self::new_in(dir.path().to_path_buf()))
+    }
+
+    pub fn new_in(working_dir: PathBuf) -> LatexCompiler {
         let cmd = ("pdflatex".into(), vec!["-interaction=nonstopmode".into()]);
 
-        Ok(LatexCompiler {
-            working_dir: dir.path().to_path_buf(),
+        LatexCompiler {
+            working_dir,
             current_dir: None,
             cmd,
-        })
+        }
+    }
+
+    pub fn with_current_dir(mut self, current_dir: PathBuf) -> Self {
+        self.current_dir = Some(current_dir);
+        self
     }
 
     /// Add a new argument to the command-line.
