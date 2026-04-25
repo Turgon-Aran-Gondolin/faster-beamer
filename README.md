@@ -37,11 +37,37 @@ This will yield the most accurate result (including title, section pages).
 faster-beamer presentation.tex --watch --unite
 ```
 
+If your slides use TikZ or other content that needs more than one LaTeX pass, add `--multi-pass` or `-m`:
+
+```bash
+faster-beamer presentation.tex --watch --multi-pass
+faster-beamer presentation.tex --watch -m 3
+```
+
+Using `--multi-pass` without a count defaults to 2 LaTeX passes.
+
+If your document uses a bibliography, choose the backend explicitly with `--bibliography` or `-b` so the compile order is correct:
+
+```bash
+faster-beamer presentation.tex --watch --bibliography bibtex
+faster-beamer presentation.tex --watch -b biber
+```
+
+When bibliography processing is enabled, `faster-beamer` runs `pdflatex`, then the chosen bibliography backend, then `pdflatex` twice by default or `COUNT` times when `--multi-pass` is set.
+
+If you suspect the cache contains stale or wrong frame PDFs, force a full rebuild of cached frames with `--force-recompile` or `-r`:
+
+```bash
+faster-beamer presentation.tex --watch --force-recompile
+faster-beamer presentation.tex --watch -r
+```
+
 ## Requirements
 
 - A Rust toolchain >= 3.39
 - A working `pdflatex` on `PATH`
 - `pdfunite` on `PATH` only if you want to use `--pdfunite`
+- `bibtex` or `biber` on `PATH` when using `--bibliography`
 
 ## Windows notes
 

@@ -5,6 +5,7 @@
 //
 use crate::beamer::get_frames;
 use crate::fs_utils::{cache_path, publish_file};
+use crate::latexcompile::BibliographyTool;
 use crate::parsing;
 
 use log::Level::Trace;
@@ -15,8 +16,8 @@ use indicatif::ProgressBar;
 use rayon::prelude::*;
 use regex::Regex;
 use std::env::current_dir;
-use std::io::ErrorKind;
 use std::fs::write;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 use std::str;
@@ -59,7 +60,7 @@ fn show_error_slide(cachedir: &Path, output_file: &str) {
         compiler.working_dir = cachedir.to_owned();
 
         let _result = compiler.run(
-            tex_input_name(&error_file),
+            &error_file,
             &LatexInput::new(),
             LatexRunOptions::new(),
         );
@@ -97,6 +98,28 @@ fn default_output_file(input_path: &Path) -> String {
     input_path.with_extension("pdf").to_string_lossy().into_owned()
 }
 
+fn bibliography_tool(args: &ArgMatches) -> Option<BibliographyTool> {
+    match args.value_of("bibliography") {
+        Some("bibtex") => Some(BibliographyTool::Bibtex),
+        Some("biber") => Some(BibliographyTool::Biber),
+        _ => None,
+    }
+}
+
+fn latex_pass_count(args: &ArgMatches) -> usize {
+    match (args.is_present("multi-pass"), args.value_of("multi-pass")) {
+        (true, Some(pass_count)) => pass_count.parse::<usize>().unwrap_or(2).max(1),
+        (true, None) => 2,
+        (false, _) => 1,
+    }
+}
+
+fn latex_run_options(latex_pass_count: usize, bibliography: Option<BibliographyTool>) -> LatexRunOptions {
+    LatexRunOptions::new()
+        .with_latex_pass_count(latex_pass_count)
+        .with_bibliography_tool(bibliography)
+}
+
 pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let cwd = current_dir().unwrap();
     let input_path = Path::new(&input_file);
@@ -110,6 +133,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .map(|output| output.to_owned())
         .unwrap_or_else(|| default_output_file(input_path));
     let correct_frame_numbers = args.is_present("frame-numbers");
+    let latex_pass_count = latex_pass_count(args);
+    let bibliography = bibliography_tool(args);
+    let run_options = latex_run_options(latex_pass_count, bibliography);
+    let force_recompile = args.is_present("force-recompile");
 
     if !input_path.is_file() {
         error!("Could not open {}", input_file);
@@ -290,27 +317,31 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .for_each(|(frame_idx, (hash, tex_content))| {
             let pdf = cache_subdir.join(format!("{:x}.pdf", hash));
 
-            if pdf.is_file() {
+            if pdf.is_file() && !force_recompile {
                 trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
             } else {
                 let latex_input = LatexInput::from_lazy(&input_dir, &cachedir)
                     .expect("Failed to create LatexInput");
 
-                let temp_file = cache_subdir.join(format!("{:x}.tex", hash));
+                let temp_file = input_dir.join(format!("{:x}.tex", hash));
 
                 if write(&temp_file, &tex_content).is_ok() {
                     let mut compiler = LatexCompiler::new()
                         .unwrap()
                         .add_arg("-shell-escape")
                         .add_arg("-interaction=nonstopmode");
-                    compiler.working_dir = temp_file.parent().unwrap().canonicalize().unwrap();
+                    compiler.working_dir = cache_subdir.clone();
+                    compiler.current_dir = Some(input_dir.clone());
 
                     let result = compiler.run(
-                        tex_input_name(&temp_file),
+                        Path::new(tex_input_name(&temp_file)),
                         &latex_input,
-                        LatexRunOptions::new(),
+                        run_options,
                     );
                     if result.is_ok() {
+                        if let Err(err) = std::fs::remove_file(&temp_file) {
+                            warn!("Failed to remove temporary frame source {}: {}", temp_file.display(), err);
+                        }
                         trace!("Compiled file {}", &temp_file.to_str().unwrap());
                     } else {
                         error!(
@@ -364,7 +395,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             "\\RequirePackage{pdfpages}", parsed_file.file_content
         );
         for (f, (hash, _)) in frames.iter().zip(generated_documents) {
-            let pdf = format!("{:x}.pdf", hash);
+            let pdf = cache_subdir
+                .join(format!("{:x}.pdf", hash))
+                .to_string_lossy()
+                .replace('\\', "/");
             united_tex = united_tex.replacen(
                 f,
                 &format!("{{\\setbeamercolor{{background canvas}}{{bg=}}\n\\includepdf[pages=-]{{{}}}\n}}", &pdf),
@@ -372,8 +406,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             );
         }
 
-        let united_tex_file = cache_subdir.join("united.tex");
-        let united_pdf = cache_subdir.join("united.pdf");
+        let united_tex_file = input_dir.join("faster-beamer-united.tex");
+        let united_pdf = cache_subdir.join("faster-beamer-united.pdf");
         let write_result = write(&united_tex_file, united_tex);
         if write_result.is_ok() {
             let mut compiler = LatexCompiler::new()
@@ -381,11 +415,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 .add_arg("-shell-escape")
                 .add_arg("-interaction=nonstopmode");
             compiler.working_dir = cache_subdir;
+            compiler.current_dir = Some(input_dir.clone());
 
             let compile_result = compiler.run(
-                tex_input_name(&united_tex_file),
+                Path::new(tex_input_name(&united_tex_file)),
                 &LatexInput::new(),
-                LatexRunOptions::new(),
+                run_options,
             );
 
             if compile_result.is_err() {
@@ -395,7 +430,14 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 );
             }
 
-            if Path::new(&united_pdf).is_file() {
+            if united_pdf.is_file() {
+                if let Err(err) = std::fs::remove_file(&united_tex_file) {
+                    warn!(
+                        "Failed to remove temporary united source {}: {}",
+                        united_tex_file.display(),
+                        err
+                    );
+                }
                 publish_output_file(&united_pdf, &output_file)?;
             } else {
                 error!("Compilation failed!");

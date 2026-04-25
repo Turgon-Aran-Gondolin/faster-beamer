@@ -69,6 +69,36 @@ fn main() {
                 .help("Use tree-sitter to parse LaTeX (instead of regexes)"),
         )
         .arg(
+            Arg::with_name("multi-pass")
+                .short("m")
+                .long("multi-pass")
+                .takes_value(true)
+                .min_values(0)
+                .max_values(1)
+                .require_equals(true)
+                .value_name("COUNT")
+                .validator(|value: String| match value.parse::<usize>() {
+                    Ok(count) if count > 0 => Ok(()),
+                    _ => Err(String::from("COUNT must be a positive integer")),
+                })
+                .help("Run pdflatex COUNT times total; using the flag without COUNT defaults to 2 passes"),
+        )
+        .arg(
+            Arg::with_name("bibliography")
+                .short("b")
+                .long("bibliography")
+                .takes_value(true)
+                .possible_values(&["bibtex", "biber"])
+                .value_name("BACKEND")
+                .help("Run bibliography processing as pdflatex, BACKEND, then pdflatex twice by default or COUNT times if --multi-pass is set"),
+        )
+        .arg(
+            Arg::with_name("force-recompile")
+                .short("r")
+                .long("force-recompile")
+                .help("Ignore cached frame PDFs and rebuild them from scratch"),
+        )
+        .arg(
             Arg::with_name("OUTPUT")
                 .help("Filename for output PDF (defaults to INPUT with a .pdf extension)")
                 .index(2),

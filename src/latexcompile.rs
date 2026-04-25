@@ -52,21 +52,49 @@
 use crate::fs_utils::{stage_directory_into, stage_file_into};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::str;
 use tempfile::tempdir;
 
+#[derive(Clone, Copy)]
+pub enum BibliographyTool {
+    Bibtex,
+    Biber,
+}
+
+impl BibliographyTool {
+    fn command_name(self) -> &'static str {
+        match self {
+            Self::Bibtex => "bibtex",
+            Self::Biber => "biber",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct LatexRunOptions {
-    double_compilation: bool,
+    latex_pass_count: usize,
     capture_stdout: bool,
+    bibliography_tool: Option<BibliographyTool>,
 }
 
 impl LatexRunOptions {
     pub fn new() -> Self {
         Self {
-            double_compilation: false,
+            latex_pass_count: 1,
             capture_stdout: true,
+            bibliography_tool: None,
         }
+    }
+
+    pub fn with_latex_pass_count(mut self, pass_count: usize) -> Self {
+        self.latex_pass_count = pass_count.max(1);
+        self
+    }
+
+    pub fn with_bibliography_tool(mut self, tool: Option<BibliographyTool>) -> Self {
+        self.bibliography_tool = tool;
+        self
     }
 }
 
@@ -215,6 +243,7 @@ impl<'a> From<&'a str> for LatexInput {
 /// ```
 pub struct LatexCompiler {
     pub working_dir: PathBuf,
+    pub current_dir: Option<PathBuf>,
     cmd: Cmd,
 }
 
@@ -226,6 +255,7 @@ impl LatexCompiler {
 
         Ok(LatexCompiler {
             working_dir: dir.path().to_path_buf(),
+            current_dir: None,
             cmd,
         })
     }
@@ -237,39 +267,95 @@ impl LatexCompiler {
     }
 
     /// build the command-line
-    fn get_cmd(&self, main_file: &str) -> Command {
+    fn get_cmd(&self, main_file: &Path) -> Command {
+        let current_dir = self.current_dir.as_ref().unwrap_or(&self.working_dir);
         let mut cmd = Command::new(&self.cmd.0);
-        cmd.args(&self.cmd.1)
-            .arg(main_file)
-            .current_dir(&self.working_dir);
+        cmd.args(&self.cmd.1);
+
+        if current_dir != &self.working_dir {
+            cmd.arg(format!(
+                "-output-directory={}",
+                tex_path_arg(&self.working_dir)
+            ));
+        }
+
+        cmd.arg(tex_path_arg(main_file)).current_dir(current_dir);
         cmd
+    }
+
+    fn run_latex_pass(&self, main_file: &Path) -> Result<()> {
+        let output = self.get_cmd(main_file).output().map_err(LatexError::Io)?;
+        let target = tex_path_arg(main_file);
+        Self::check_command_output(output, &self.cmd.0, &target)
+    }
+
+    fn run_bibliography_pass(&self, tool: BibliographyTool, job_name: &str) -> Result<()> {
+        let output = Command::new(tool.command_name())
+            .arg(job_name)
+            .current_dir(&self.working_dir)
+            .output()
+            .map_err(LatexError::Io)?;
+        Self::check_command_output(output, tool.command_name(), job_name)
+    }
+
+    fn check_command_output(output: Output, command: &str, target: &str) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = str::from_utf8(&output.stderr).unwrap_or("").trim();
+        let stdout = str::from_utf8(&output.stdout).unwrap_or("").trim();
+        let mut err_msg = format!("{} failed for {}", command, target);
+
+        if !stderr.is_empty() {
+            err_msg.push_str(": ");
+            err_msg.push_str(stderr);
+        } else if !stdout.is_empty() {
+            err_msg.push_str(": ");
+            err_msg.push_str(stdout);
+        }
+
+        error!("{}", &err_msg);
+        if !stdout.is_empty() {
+            error!("{}", stdout);
+        }
+
+        Err(LatexError::LatexError(err_msg))
     }
 
     pub fn run(
         &self,
-        main: &str,
+        main: &Path,
         _input: &LatexInput,
         options: LatexRunOptions,
     ) -> Result<PathBuf> {
         assert!(options.capture_stdout);
 
-        // first and second run
-        let output = self.get_cmd(main).output().map_err(LatexError::Io)?;
-        if !output.status.success() {
-            let err_msg = str::from_utf8(&output.stderr).unwrap().to_string();
-            let std_out = str::from_utf8(&output.stdout).unwrap().to_string();
+        let pdf = main.to_path_buf();
+        let latex_pass_count = options.latex_pass_count.max(1);
+        let job_name = pdf
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| LatexError::LatexError(format!("Failed to derive job name from {}", main.display())))?;
 
-            error!("{}", &err_msg);
-            error!("{}", &std_out);
-            return Err(LatexError::LatexError(err_msg));
-        };
-        if options.double_compilation {
-            let _err_code = self.get_cmd(main).output().map_err(LatexError::Io)?;
+        if let Some(tool) = options.bibliography_tool {
+            self.run_latex_pass(main)?;
+            self.run_bibliography_pass(tool, job_name)?;
+            for _ in 0..latex_pass_count.max(2) {
+                self.run_latex_pass(main)?;
+            }
+        } else {
+            for _ in 0..latex_pass_count {
+                self.run_latex_pass(main)?;
+            }
         }
 
         // get the output file
-        let pdf = PathBuf::from(main); //self.get_result_path(PathBuf::from(main))?;
         let stem = PathBuf::from(pdf.file_stem().unwrap().to_str().unwrap());
         Ok(self.working_dir.join(stem.with_extension("pdf")))
     }
+}
+
+fn tex_path_arg(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }

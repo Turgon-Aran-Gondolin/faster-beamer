@@ -3,6 +3,9 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf, Prefix};
 
+#[cfg(windows)]
+use junction;
+
 pub fn cache_relative_path(path: &Path) -> PathBuf {
     let mut relative = PathBuf::new();
     let mut saw_prefix = false;
@@ -92,8 +95,27 @@ pub fn stage_directory_into(root: &Path, source: &Path) -> io::Result<PathBuf> {
         return Ok(dest);
     }
 
-    copy_dir_recursive(source, &dest)?;
-    Ok(dest)
+    #[cfg(windows)]
+    {
+        if junction::create(source, &dest).is_ok() {
+            return Ok(dest);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "failed to stage directory {} into {} using a symlink or junction",
+                source.display(),
+                dest.display()
+            ),
+        ))
+    }
+
+    #[cfg(not(windows))]
+    {
+        copy_dir_recursive(source, &dest)?;
+        Ok(dest)
+    }
 }
 
 pub fn publish_file(source: &Path, dest: &Path) -> io::Result<()> {
@@ -111,6 +133,7 @@ pub fn publish_file(source: &Path, dest: &Path) -> io::Result<()> {
     })
 }
 
+#[cfg(not(windows))]
 fn copy_dir_recursive(source: &Path, dest: &Path) -> io::Result<()> {
     fs::create_dir_all(dest)?;
 
