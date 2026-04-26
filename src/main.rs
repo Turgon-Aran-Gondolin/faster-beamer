@@ -29,7 +29,7 @@ fn main() {
     }
 
     let matches = App::new("faster-beamer")
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(option_env!("FASTER_BEAMER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))
         .author("Stephan Seitz <stephan.seitz@fau.de>")
         .about("Incremental compiler for Beamer LaTeX presentations")
         .arg(
