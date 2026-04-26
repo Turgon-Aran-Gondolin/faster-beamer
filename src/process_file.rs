@@ -53,7 +53,7 @@ struct FrameSyncTexMap {
 
 impl FrameSyncTexMap {
     fn map_temp_line(&self, temp_line: usize) -> usize {
-        for segment in &self.segments {
+        for segment in self.segments.iter().rev() {
             if temp_line >= segment.temp_start_line
                 && temp_line < segment.temp_start_line + segment.line_count
             {
@@ -73,11 +73,11 @@ struct GeneratedDocument {
 
 lazy_static! {
     static ref FRAME_REGEX: Regex =
-        Regex::new(r"(?ms)^[\s\t]*?\\begin\{frame\}.*?^[\s\t]*?\\end\{frame\}").unwrap();
+        Regex::new(r"(?ms)^[ \t]*\\begin\{frame\}.*?^[ \t]*\\end\{frame\}").unwrap();
 }
 lazy_static! {
     static ref DOCUMENT_REGEX: Regex =
-        Regex::new(r"(?ms)^[\s\t]*?\\begin\{document\}.*^[\s\t]*?\\end\{document\}").unwrap();
+        Regex::new(r"(?ms)^[ \t]*\\begin\{document\}.*^[ \t]*\\end\{document\}").unwrap();
 }
 
 lazy_static! {
@@ -356,9 +356,7 @@ fn split_trailing_frame_boundary(segment: &str) -> (&str, &str) {
 
 fn append_united_frame_placeholder(
     united_tex: &mut String,
-    segments: &mut Vec<SyncTexLineSegment>,
     current_temp_line: &mut usize,
-    source_frame_start_line: usize,
     source_frame_line_count: usize,
     replacement: &str,
 ) {
@@ -366,14 +364,6 @@ fn append_united_frame_placeholder(
 
     let line_count = logical_line_count(replacement);
     let _ = source_frame_line_count;
-
-    for offset in 0..line_count {
-        segments.push(SyncTexLineSegment {
-            temp_start_line: *current_temp_line + offset,
-            line_count: 1,
-            source_start_line: source_frame_start_line + 1,
-        });
-    }
     *current_temp_line += line_count;
 }
 
@@ -389,6 +379,7 @@ fn build_united_document(
     let mut segments = Vec::new();
     let mut current_temp_line = logical_line_count(&united_tex) + 1;
     let mut source_cursor = 0usize;
+    let mut frame_path_segments = Vec::new();
 
     for ((frame, (source_frame_start_line, source_frame_line_count)), document) in frames
         .iter()
@@ -413,19 +404,17 @@ fn build_united_document(
             source_segment,
         );
 
-        let frame_pdf = cache_subdir
-            .join(format!("{:x}.pdf", document.hash))
+        let frame_pdf = compiled_pdf_path(cache_subdir, &document.sync_map.temp_file_name)
             .to_string_lossy()
             .replace('\\', "/");
         let replacement = frame_boundary_segment.to_owned()
             + "{\\setbeamercolor{background canvas}{bg=}\n\\includepdf[\n  pages=-,\n  pagecommand={\\smash{\\hbox to 0pt{\\phantom{.}\\hss}}}\n]{"
             + &frame_pdf
             + "}\n}";
+        frame_path_segments.push((frame_pdf, *source_frame_start_line));
         append_united_frame_placeholder(
             &mut united_tex,
-            &mut segments,
             &mut current_temp_line,
-            *source_frame_start_line,
             *source_frame_line_count,
             &replacement,
         );
@@ -442,6 +431,23 @@ fn build_united_document(
         source_cursor,
         source_suffix,
     );
+
+    let mut search_cursor = 0usize;
+    for (frame_pdf, source_frame_start_line) in frame_path_segments {
+        let path_offset = united_tex[search_cursor..].find(&frame_pdf).ok_or_else(|| {
+            error!(
+                "Failed to locate included PDF path while building united SyncTeX mapping."
+            );
+            FasterBeamerError::CompileError
+        })?;
+        let path_idx = search_cursor + path_offset;
+        segments.push(SyncTexLineSegment {
+            temp_start_line: line_number_at(&united_tex, path_idx),
+            line_count: 1,
+            source_start_line: source_frame_start_line,
+        });
+        search_cursor = path_idx + frame_pdf.len();
+    }
 
     Ok((
         united_tex,
@@ -469,6 +475,10 @@ fn frame_temp_file_name(hash: &md5::Digest) -> String {
 
 fn preamble_job_name(preamble_hash: &md5::Digest, is_draft: bool) -> String {
     format!("{}{:x}_{}", PREAMBLE_TEMP_PREFIX, preamble_hash, is_draft)
+}
+
+fn compiled_pdf_path(cache_subdir: &Path, temp_file_name: &str) -> PathBuf {
+    cache_subdir.join(Path::new(temp_file_name).with_extension("pdf"))
 }
 
 fn current_cache_paths(input_file: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -833,7 +843,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
         let hash = md5::compute(&compile_string);
         let temp_file_name = frame_temp_file_name(&hash);
-        let output = cache_subdir.join(format!("{:x}.pdf", hash));
+        let output = compiled_pdf_path(&cache_subdir, &temp_file_name);
         let temp_frame_start_line = logical_line_count(&compile_prefix) + 1;
         let temp_document_begin_line = logical_line_count(&(format_line.clone() + &preamble + "\n")) + 1;
         let temp_document_end_line = logical_line_count(&(compile_prefix.clone() + &f + "\n")) + 1;
@@ -901,8 +911,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let progress_bar = ProgressBar::new(compile_targets.len() as u64);
     let latex_input = LatexInput::new();
 
-    let compile_document = |frame_idx: usize, document: &GeneratedDocument| {
-            let pdf = cache_subdir.join(format!("{:x}.pdf", document.hash));
+        let compile_document = |frame_idx: usize, document: &GeneratedDocument| {
+            let pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
 
             if pdf.is_file() && !force_recompile {
                 trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
@@ -1066,7 +1076,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         }
         if first_changed_frame < generated_documents.len() {
             let document = &generated_documents[first_changed_frame];
-            let compiled_pdf = cache_subdir.join(format!("{:x}.pdf", document.hash));
+            let compiled_pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
 
             if Path::new(&compiled_pdf).is_file() {
                 publish_output_artifacts(&compiled_pdf, &output_file, Some(&document.sync_map))?;
