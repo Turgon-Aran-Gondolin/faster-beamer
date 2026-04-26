@@ -255,7 +255,10 @@ impl LatexCompiler {
     }
 
     pub fn new_in(working_dir: PathBuf) -> LatexCompiler {
-        let cmd = ("pdflatex".into(), vec!["-interaction=nonstopmode".into()]);
+        let cmd = (
+            "pdflatex".into(),
+            vec!["-interaction=nonstopmode".into(), "-synctex=5".into()],
+        );
 
         LatexCompiler {
             working_dir,

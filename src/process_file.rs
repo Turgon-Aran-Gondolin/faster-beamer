@@ -8,6 +8,9 @@ use crate::fs_utils::{cache_path, publish_file};
 use crate::latexcompile::BibliographyTool;
 use crate::parsing;
 
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use log::Level::Trace;
 
 use crate::latexcompile::{LatexCompiler, LatexInput, LatexRunOptions};
@@ -17,8 +20,8 @@ use rayon::prelude::*;
 use regex::Regex;
 use std::env::current_dir;
 use std::fs::write;
-use std::io::ErrorKind;
-use std::path::Path;
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
 use std::sync::Mutex;
@@ -33,6 +36,38 @@ pub enum FasterBeamerError {
 }
 
 pub type Result<T> = ::std::result::Result<T, FasterBeamerError>;
+
+struct SyncTexLineSegment {
+    temp_start_line: usize,
+    line_count: usize,
+    source_start_line: usize,
+}
+
+struct FrameSyncTexMap {
+    source_file: PathBuf,
+    temp_file_name: String,
+    segments: Vec<SyncTexLineSegment>,
+}
+
+impl FrameSyncTexMap {
+    fn map_temp_line(&self, temp_line: usize) -> usize {
+        for segment in &self.segments {
+            if temp_line >= segment.temp_start_line
+                && temp_line < segment.temp_start_line + segment.line_count
+            {
+                return segment.source_start_line + (temp_line - segment.temp_start_line);
+            }
+        }
+
+        temp_line
+    }
+}
+
+struct GeneratedDocument {
+    hash: md5::Digest,
+    tex_content: String,
+    sync_map: FrameSyncTexMap,
+}
 
 lazy_static! {
     static ref FRAME_REGEX: Regex =
@@ -86,6 +121,306 @@ fn publish_output_file(compiled_pdf: &Path, output_file: &str) -> Result<()> {
     })
 }
 
+fn clear_published_synctex(output_file: &str) {
+    let synctex_file = Path::new(output_file).with_extension("synctex.gz");
+    if synctex_file.is_file() {
+        if let Err(err) = std::fs::remove_file(&synctex_file) {
+            warn!(
+                "Failed to remove stale SyncTeX file {}: {}",
+                synctex_file.display(),
+                err
+            );
+        }
+    }
+}
+
+fn publish_synctex_file(compiled_pdf: &Path, output_file: &str) -> Result<()> {
+    let compiled_synctex = compiled_pdf.with_extension("synctex.gz");
+    if !compiled_synctex.is_file() {
+        warn!(
+            "Expected SyncTeX output {} but it was not generated.",
+            compiled_synctex.display()
+        );
+        return Ok(());
+    }
+
+    let output_synctex = Path::new(output_file).with_extension("synctex.gz");
+    info!("Publishing: {:?} -> {:?}", compiled_synctex, output_synctex);
+    publish_file(&compiled_synctex, &output_synctex).map_err(|err| {
+        error!("{}", err);
+        FasterBeamerError::IoError
+    })
+}
+
+fn publish_output_artifacts(
+    compiled_pdf: &Path,
+    output_file: &str,
+    sync_map: Option<&FrameSyncTexMap>,
+) -> Result<()> {
+    publish_output_file(compiled_pdf, output_file)?;
+
+    match sync_map {
+        Some(sync_map) => {
+            rewrite_synctex_to_original(compiled_pdf, sync_map)?;
+            publish_synctex_file(compiled_pdf, output_file)
+        }
+        None => {
+            clear_published_synctex(output_file);
+            Ok(())
+        }
+    }
+}
+
+fn rewrite_synctex_to_original(compiled_pdf: &Path, sync_map: &FrameSyncTexMap) -> Result<()> {
+    let synctex_file = compiled_pdf.with_extension("synctex.gz");
+    if !synctex_file.is_file() {
+        return Ok(());
+    }
+
+    let compressed = std::fs::read(&synctex_file).map_err(|err| {
+        error!("Failed to read SyncTeX file {}: {}", synctex_file.display(), err);
+        FasterBeamerError::IoError
+    })?;
+
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut content = String::new();
+    decoder.read_to_string(&mut content).map_err(|err| {
+        error!("Failed to decode SyncTeX file {}: {}", synctex_file.display(), err);
+        FasterBeamerError::IoError
+    })?;
+
+    let rewritten = remap_synctex_contents(&content, sync_map);
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(rewritten.as_bytes()).map_err(|err| {
+        error!("Failed to encode SyncTeX file {}: {}", synctex_file.display(), err);
+        FasterBeamerError::IoError
+    })?;
+    let compressed = encoder.finish().map_err(|err| {
+        error!("Failed to finish SyncTeX encoding for {}: {}", synctex_file.display(), err);
+        FasterBeamerError::IoError
+    })?;
+
+    std::fs::write(&synctex_file, compressed).map_err(|err| {
+        error!("Failed to write SyncTeX file {}: {}", synctex_file.display(), err);
+        FasterBeamerError::IoError
+    })
+}
+
+fn remap_synctex_contents(content: &str, sync_map: &FrameSyncTexMap) -> String {
+    let mut temp_tag = None;
+    let mut rewritten_lines = Vec::new();
+
+    for line in content.lines() {
+        if let Some((tag, path)) = parse_synctex_input_line(line) {
+            if synctex_input_matches(path, &sync_map.temp_file_name) {
+                temp_tag = Some(tag);
+                rewritten_lines.push(format!("Input:{}:{}", tag, synctex_path(&sync_map.source_file)));
+                continue;
+            }
+        }
+
+        if let Some(tag) = temp_tag {
+            if let Some(rewritten) = remap_synctex_link_line(line, tag, sync_map) {
+                rewritten_lines.push(rewritten);
+                continue;
+            }
+        }
+
+        rewritten_lines.push(line.to_owned());
+    }
+
+    let mut rewritten = rewritten_lines.join("\n");
+    if content.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
+fn parse_synctex_input_line(line: &str) -> Option<(u32, &str)> {
+    let rest = line.strip_prefix("Input:")?;
+    let mut parts = rest.splitn(2, ':');
+    let tag = parts.next()?.parse::<u32>().ok()?;
+    let path = parts.next()?;
+    Some((tag, path))
+}
+
+fn synctex_input_matches(path: &str, temp_file_name: &str) -> bool {
+    path == temp_file_name
+        || Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == temp_file_name)
+            .unwrap_or(false)
+}
+
+fn remap_synctex_link_line(line: &str, temp_tag: u32, sync_map: &FrameSyncTexMap) -> Option<String> {
+    let first_char = line.chars().next()?;
+    if !matches!(first_char, '[' | '(' | 'x' | 'k' | 'g' | '$' | 'v' | 'h') {
+        return None;
+    }
+
+    let prefix_len = first_char.len_utf8();
+    let rest = &line[prefix_len..];
+    let colon_idx = rest.find(':')?;
+    let link = &rest[..colon_idx];
+    let mut parts = link.split(',');
+    let tag = parts.next()?.parse::<u32>().ok()?;
+    if tag != temp_tag {
+        return None;
+    }
+
+    let line_no = parts.next()?.parse::<usize>().ok()?;
+    let remapped_line = sync_map.map_temp_line(line_no);
+    let mut rewritten_link = format!("{},{}", tag, remapped_line);
+    if let Some(column) = parts.next() {
+        rewritten_link.push(',');
+        rewritten_link.push_str(column);
+    }
+
+    Some(format!(
+        "{}{}{}",
+        &line[..prefix_len],
+        rewritten_link,
+        &rest[colon_idx..]
+    ))
+}
+
+fn logical_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    }
+}
+
+fn line_number_at(text: &str, byte_idx: usize) -> usize {
+    text[..byte_idx].bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+fn synctex_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn append_united_source_segment(
+    united_tex: &mut String,
+    segments: &mut Vec<SyncTexLineSegment>,
+    current_temp_line: &mut usize,
+    source_content: &str,
+    source_start_idx: usize,
+    source_segment: &str,
+) {
+    united_tex.push_str(source_segment);
+
+    let line_count = logical_line_count(source_segment);
+    if line_count == 0 {
+        return;
+    }
+
+    segments.push(SyncTexLineSegment {
+        temp_start_line: *current_temp_line,
+        line_count,
+        source_start_line: line_number_at(source_content, source_start_idx),
+    });
+    *current_temp_line += line_count;
+}
+
+fn append_united_frame_placeholder(
+    united_tex: &mut String,
+    segments: &mut Vec<SyncTexLineSegment>,
+    current_temp_line: &mut usize,
+    source_frame_start_line: usize,
+    source_frame_line_count: usize,
+    replacement: &str,
+) {
+    united_tex.push_str(replacement);
+
+    let line_count = logical_line_count(replacement);
+    let _ = source_frame_line_count;
+
+    for offset in 0..line_count {
+        segments.push(SyncTexLineSegment {
+            temp_start_line: *current_temp_line + offset,
+            line_count: 1,
+            source_start_line: source_frame_start_line + 1,
+        });
+    }
+    *current_temp_line += line_count;
+}
+
+fn build_united_document(
+    source_content: &str,
+    frames: &[String],
+    frame_source_lines: &[(usize, usize)],
+    generated_documents: &[GeneratedDocument],
+    cache_subdir: &Path,
+    original_source_path: &Path,
+) -> Result<(String, FrameSyncTexMap)> {
+    let mut united_tex = String::from("\\RequirePackage{pdfpages}\n");
+    let mut segments = Vec::new();
+    let mut current_temp_line = logical_line_count(&united_tex) + 1;
+    let mut source_cursor = 0usize;
+
+    for ((frame, (source_frame_start_line, source_frame_line_count)), document) in frames
+        .iter()
+        .zip(frame_source_lines.iter())
+        .zip(generated_documents.iter())
+    {
+        let frame_start_offset = source_content[source_cursor..].find(frame).ok_or_else(|| {
+            error!("Failed to locate frame text while building united SyncTeX mapping.");
+            FasterBeamerError::CompileError
+        })?;
+        let frame_start_idx = source_cursor + frame_start_offset;
+        let source_segment = &source_content[source_cursor..frame_start_idx];
+
+        append_united_source_segment(
+            &mut united_tex,
+            &mut segments,
+            &mut current_temp_line,
+            source_content,
+            source_cursor,
+            source_segment,
+        );
+
+        let frame_pdf = cache_subdir
+            .join(format!("{:x}.pdf", document.hash))
+            .to_string_lossy()
+            .replace('\\', "/");
+        let replacement = String::from(
+            "{\\setbeamercolor{background canvas}{bg=}\n\\includepdf[\n  pages=-,\n  pagecommand={\\smash{\\mbox{}}}\n]{",
+        ) + &frame_pdf
+            + "}\n}";
+        append_united_frame_placeholder(
+            &mut united_tex,
+            &mut segments,
+            &mut current_temp_line,
+            *source_frame_start_line,
+            *source_frame_line_count,
+            &replacement,
+        );
+
+        source_cursor = frame_start_idx + frame.len();
+    }
+
+    let source_suffix = &source_content[source_cursor..];
+    append_united_source_segment(
+        &mut united_tex,
+        &mut segments,
+        &mut current_temp_line,
+        source_content,
+        source_cursor,
+        source_suffix,
+    );
+
+    Ok((
+        united_tex,
+        FrameSyncTexMap {
+            source_file: original_source_path.to_path_buf(),
+            temp_file_name: String::from("faster-beamer-united.tex"),
+            segments,
+        },
+    ))
+}
+
 fn tex_input_name(path: &Path) -> &str {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -126,6 +461,9 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .unwrap_or(&cwd)
         .canonicalize()
         .unwrap_or_else(|_| cwd.to_owned());
+    let original_source_path = input_path
+        .canonicalize()
+        .unwrap_or_else(|_| input_dir.join(tex_input_name(input_path)));
     let output_file = args
         .value_of("OUTPUT")
         .map(|output| output.to_owned())
@@ -152,17 +490,27 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     };
 
     let mut frames = Vec::with_capacity(frame_nodes.len());
+    let mut frame_source_lines = Vec::with_capacity(frame_nodes.len());
     if !frame_nodes.is_empty() {
         for f in frame_nodes.iter() {
             info!("Found {} frames with tree-sitter.", frame_nodes.len());
             let node_string = parsed_file.get_node_string(&f);
             frames.push(node_string.to_string());
+            frame_source_lines.push((
+                line_number_at(&parsed_file.file_content, f.start_byte()),
+                logical_line_count(node_string),
+            ));
         }
     } else {
         for cap in FRAME_REGEX.captures_iter(&parsed_file.file_content) {
-            let frame_string = cap[0].to_string();
+            let frame_match = cap.get(0).unwrap();
+            let frame_string = frame_match.as_str().to_string();
             trace!("Frame {}:\n{}", frames.len() + 1, &frame_string);
             frames.push(frame_string);
+            frame_source_lines.push((
+                line_number_at(&parsed_file.file_content, frame_match.start()),
+                logical_line_count(frame_match.as_str()),
+            ));
         }
     }
     info!("Found {} frames.", frames.len());
@@ -224,6 +572,15 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     })?;
 
     let preamble_hash = md5::compute(&preamble);
+    let preamble_line_count = logical_line_count(&preamble);
+    let document_begin_line = find
+        .map(|idx| line_number_at(&parsed_file.file_content, idx))
+        .unwrap_or(preamble_line_count + 1);
+    let document_end_line = parsed_file
+        .file_content
+        .rfind("\\end{document}")
+        .map(|idx| line_number_at(&parsed_file.file_content, idx))
+        .unwrap_or(document_begin_line);
     let preamble_filename = format!("{:x}_{}", preamble_hash, args.is_present("draft"));
     if input_path
         .parent()
@@ -270,24 +627,61 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
     let mut generated_documents = Vec::new();
     let mut command = Command::new("pdfunite");
-    for (frame_idx, f) in frames.iter().enumerate() {
+    for (frame_idx, (f, (source_frame_start_line, frame_line_count))) in frames
+        .iter()
+        .zip(frame_source_lines.iter())
+        .enumerate()
+    {
         let frame_idx_str = if correct_frame_numbers {
             format!("{}", frame_idx)
         } else {
             format!("{}", 0)
         };
-        let compile_string = format!("%&{}\n", preamble_filename)
-            + &preamble
-            + "\n\\begin{document}\n"
-            + "\\addtocounter{framenumber}{"
-            + &frame_idx_str
-            + "}\n"
-            + &f
-            + "\n\\end{document}\n";
+        let format_line = format!("%&{}\n", preamble_filename);
+        let frame_number_line = format!("\\addtocounter{{framenumber}}{{{}}}\n", frame_idx_str);
+        let compile_prefix = format_line.clone() + &preamble + "\n\\begin{document}\n" + &frame_number_line;
+        let compile_string = compile_prefix.clone() + &f + "\n\\end{document}\n";
 
         let hash = md5::compute(&compile_string);
+        let temp_file_name = format!("{:x}.tex", hash);
         let output = cache_subdir.join(format!("{:x}.pdf", hash));
-        generated_documents.push((hash, compile_string));
+        let temp_frame_start_line = logical_line_count(&compile_prefix) + 1;
+        let temp_document_begin_line = logical_line_count(&(format_line.clone() + &preamble + "\n")) + 1;
+        let temp_document_end_line = logical_line_count(&(compile_prefix.clone() + &f + "\n")) + 1;
+        let mut segments = Vec::new();
+
+        if preamble_line_count > 0 {
+            segments.push(SyncTexLineSegment {
+                temp_start_line: logical_line_count(&format_line) + 1,
+                line_count: preamble_line_count,
+                source_start_line: 1,
+            });
+        }
+        segments.push(SyncTexLineSegment {
+            temp_start_line: temp_document_begin_line,
+            line_count: 1,
+            source_start_line: document_begin_line,
+        });
+        segments.push(SyncTexLineSegment {
+            temp_start_line: temp_frame_start_line,
+            line_count: *frame_line_count,
+            source_start_line: *source_frame_start_line,
+        });
+        segments.push(SyncTexLineSegment {
+            temp_start_line: temp_document_end_line,
+            line_count: 1,
+            source_start_line: document_end_line,
+        });
+
+        generated_documents.push(GeneratedDocument {
+            hash,
+            tex_content: compile_string,
+            sync_map: FrameSyncTexMap {
+                source_file: original_source_path.clone(),
+                temp_file_name,
+                segments,
+            },
+        });
 
         command.arg(&output);
     }
@@ -311,15 +705,15 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let progress_bar = ProgressBar::new(generated_documents.len() as u64);
     let latex_input = LatexInput::new();
 
-    let compile_document = |frame_idx: usize, (hash, tex_content): &(md5::Digest, String)| {
-            let pdf = cache_subdir.join(format!("{:x}.pdf", hash));
+    let compile_document = |frame_idx: usize, document: &GeneratedDocument| {
+            let pdf = cache_subdir.join(format!("{:x}.pdf", document.hash));
 
             if pdf.is_file() && !force_recompile {
                 trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
             } else {
-                let temp_file = input_dir.join(format!("{:x}.tex", hash));
+                let temp_file = input_dir.join(&document.sync_map.temp_file_name);
 
-                if write(&temp_file, &tex_content).is_ok() {
+                if write(&temp_file, &document.tex_content).is_ok() {
                     let compiler = LatexCompiler::new_in(cache_subdir.clone())
                         .add_arg("-shell-escape")
                         .add_arg("-interaction=nonstopmode")
@@ -389,26 +783,21 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::PdfUniteError);
             }
-            _ => {}
+            _ => {
+                clear_published_synctex(&output_file);
+            }
         };
     } else if args.is_present("unite") {
         info!("Pasting precompiled frames into original document!");
 
-        let mut united_tex = format!(
-            "{}\n{}",
-            "\\RequirePackage{pdfpages}", parsed_file.file_content
-        );
-        for (f, (hash, _)) in frames.iter().zip(generated_documents) {
-            let pdf = cache_subdir
-                .join(format!("{:x}.pdf", hash))
-                .to_string_lossy()
-                .replace('\\', "/");
-            united_tex = united_tex.replacen(
-                f,
-                &format!("{{\\setbeamercolor{{background canvas}}{{bg=}}\n\\includepdf[pages=-]{{{}}}\n}}", &pdf),
-                1,
-            );
-        }
+        let (united_tex, united_sync_map) = build_united_document(
+            &parsed_file.file_content,
+            &frames,
+            &frame_source_lines,
+            &generated_documents,
+            &cache_subdir,
+            &original_source_path,
+        )?;
 
         let united_tex_file = input_dir.join("faster-beamer-united.tex");
         let united_pdf = cache_subdir.join("faster-beamer-united.pdf");
@@ -433,6 +822,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             }
 
             if united_pdf.is_file() {
+                publish_output_artifacts(&united_pdf, &output_file, Some(&united_sync_map))?;
                 if let Err(err) = std::fs::remove_file(&united_tex_file) {
                     warn!(
                         "Failed to remove temporary united source {}: {}",
@@ -440,7 +830,6 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         err
                     );
                 }
-                publish_output_file(&united_pdf, &output_file)?;
             } else {
                 error!("Compilation failed!");
                 show_error_slide(&cachedir, &output_file);
@@ -457,11 +846,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             first_changed_frame = 0;
         }
         if first_changed_frame < generated_documents.len() {
-            let (hash, _) = generated_documents[first_changed_frame];
-            let compiled_pdf = cache_subdir.join(format!("{:x}.pdf", hash));
+            let document = &generated_documents[first_changed_frame];
+            let compiled_pdf = cache_subdir.join(format!("{:x}.pdf", document.hash));
 
             if Path::new(&compiled_pdf).is_file() {
-                publish_output_file(&compiled_pdf, &output_file)?;
+                publish_output_artifacts(&compiled_pdf, &output_file, Some(&document.sync_map))?;
             } else {
                 error!("Compilation failed!");
                 show_error_slide(&cachedir, &output_file);
