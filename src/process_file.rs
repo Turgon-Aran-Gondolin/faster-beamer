@@ -818,14 +818,17 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .zip(frame_source_lines.iter())
         .enumerate()
     {
-        let frame_idx_str = if correct_frame_numbers {
-            format!("{}", frame_idx)
-        } else {
-            format!("{}", 0)
-        };
         let format_line = format!("%&{}\n", preamble_filename);
-        let frame_number_line = format!("\\addtocounter{{framenumber}}{{{}}}\n", frame_idx_str);
-        let compile_prefix = format_line.clone() + &preamble + "\n\\begin{document}\n" + &frame_number_line;
+        let counter_setup = if correct_frame_numbers {
+            format!(
+                "\\setcounter{{framenumber}}{{{}}}\n\\setcounter{{page}}{{{}}}\n",
+                frame_idx,
+                frame_idx + 1,
+            )
+        } else {
+            String::new()
+        };
+        let compile_prefix = format_line.clone() + &preamble + "\n\\begin{document}\n" + &counter_setup;
         let compile_string = compile_prefix.clone() + &f + "\n\\end{document}\n";
 
         let hash = md5::compute(&compile_string);
