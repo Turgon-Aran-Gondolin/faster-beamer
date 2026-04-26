@@ -39,6 +39,11 @@ fn main() {
                 .help("Watch the input file and rebuild on changes"),
         )
         .arg(
+            Arg::with_name("clean")
+                .long("clean")
+                .help("Remove faster-beamer cache, auxiliary files, and stale temporary files for the input"),
+        )
+        .arg(
             Arg::with_name("INPUT")
                 .help("Sets the input file to use")
                 .required(true)
@@ -105,6 +110,38 @@ fn main() {
                 .help("Compile independent frame PDFs in parallel"),
         )
         .arg(
+            Arg::with_name("jobs")
+                .short("j")
+                .long("jobs")
+                .visible_alias("smp")
+                .takes_value(true)
+                .value_name("COUNT")
+                .validator(|value: String| match value.parse::<usize>() {
+                    Ok(count) if count > 0 => Ok(()),
+                    _ => Err(String::from("COUNT must be a positive integer")),
+                })
+                .help("Compile with up to COUNT parallel jobs; implies parallel compilation"),
+        )
+        .arg(
+            Arg::with_name("compiler-option")
+                .long("compiler-option")
+                .takes_value(true)
+                .multiple(true)
+                .allow_hyphen_values(true)
+                .value_name("OPTION")
+                .help("Pass OPTION through to pdflatex for frame and united builds; may be supplied multiple times"),
+        )
+        .arg(
+            Arg::with_name("output")
+                .short("o")
+                .long("output")
+                .visible_alias("out")
+                .takes_value(true)
+                .value_name("FILE")
+                .conflicts_with("OUTPUT")
+                .help("Write the output PDF to FILE"),
+        )
+        .arg(
             Arg::with_name("OUTPUT")
                 .help("Filename for output PDF (defaults to INPUT with a .pdf extension)")
                 .index(2),
@@ -127,6 +164,14 @@ fn main() {
         .unwrap_or_else(|_| cwd.to_owned());
 
     info!("Processing {:?}.", input_file);
+    if matches.is_present("clean") {
+        let result = process_file::clean_generated_artifacts(input_file, &matches);
+        if result == Err(FasterBeamerError::InputFileNotExistent) || result == Err(FasterBeamerError::IoError) {
+            std::process::exit(-1);
+        };
+        return;
+    }
+
     let result = process_file::process_file(input_file, &matches);
     if result == Err(FasterBeamerError::InputFileNotExistent) || result == Err(FasterBeamerError::IoError) {
         std::process::exit(-1);

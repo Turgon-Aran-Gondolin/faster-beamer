@@ -62,11 +62,38 @@ faster-beamer presentation.tex --watch --force-recompile
 faster-beamer presentation.tex --watch -r
 ```
 
+If you want to remove faster-beamer's cached outputs, published SyncTeX sidecar, and stale temporary source files for one input, use `--clean`:
+
+```bash
+faster-beamer presentation.tex --clean
+```
+
 If you want to compile independent frame PDFs concurrently, enable parallelization with `--parallel` or `-p`:
 
 ```bash
 faster-beamer presentation.tex --watch --parallel
 faster-beamer presentation.tex --watch -p
+```
+
+If you want explicit control over the amount of parallelism, use `--jobs` / `-j` (or the `--smp` alias). Supplying a job count implies parallel compilation:
+
+```bash
+faster-beamer presentation.tex --watch --jobs 4
+faster-beamer presentation.tex --watch --smp 2
+```
+
+If you prefer a named output flag instead of the positional output argument, use `--output` / `-o` (or the `--out` alias):
+
+```bash
+faster-beamer presentation.tex --watch --output preview.pdf
+faster-beamer presentation.tex --watch -o preview.pdf
+```
+
+If you need to pass additional `pdflatex` flags through for frame and united builds, use repeated `--compiler-option` values:
+
+```bash
+faster-beamer presentation.tex --compiler-option=-file-line-error
+faster-beamer presentation.tex --compiler-option=-draftmode --compiler-option=-file-line-error
 ```
 
 ## Requirements

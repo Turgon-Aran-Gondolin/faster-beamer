@@ -18,6 +18,7 @@ use clap::ArgMatches;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use regex::Regex;
+use std::collections::HashSet;
 use std::env::current_dir;
 use std::fs::write;
 use std::io::{ErrorKind, Read, Write};
@@ -25,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
 #[derive(PartialEq)]
@@ -81,6 +83,10 @@ lazy_static! {
 lazy_static! {
     static ref PREVIOUS_FRAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 }
+
+const FRAME_TEMP_PREFIX: &str = "faster-beamer-temp-";
+const PREAMBLE_TEMP_PREFIX: &str = "faster-beamer-preamble-";
+const UNITED_TEMP_PREFIX: &str = "faster-beamer-united-";
 
 fn show_error_slide(cachedir: &Path, output_file: &str) {
     let error_frame = String::from_utf8_lossy(include_bytes!("error.tex")).to_owned();
@@ -324,6 +330,30 @@ fn append_united_source_segment(
     *current_temp_line += line_count;
 }
 
+fn split_trailing_frame_boundary(segment: &str) -> (&str, &str) {
+    let lines: Vec<&str> = segment.split_inclusive('\n').collect();
+    let mut suffix_line_count = 0usize;
+
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('%') {
+            suffix_line_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if suffix_line_count == 0 {
+        return (segment, "");
+    }
+
+    let split_idx = lines[..lines.len() - suffix_line_count]
+        .iter()
+        .map(|line| line.len())
+        .sum();
+    (&segment[..split_idx], &segment[split_idx..])
+}
+
 fn append_united_frame_placeholder(
     united_tex: &mut String,
     segments: &mut Vec<SyncTexLineSegment>,
@@ -371,6 +401,8 @@ fn build_united_document(
         })?;
         let frame_start_idx = source_cursor + frame_start_offset;
         let source_segment = &source_content[source_cursor..frame_start_idx];
+        let (source_segment, frame_boundary_segment) =
+            split_trailing_frame_boundary(source_segment);
 
         append_united_source_segment(
             &mut united_tex,
@@ -385,9 +417,9 @@ fn build_united_document(
             .join(format!("{:x}.pdf", document.hash))
             .to_string_lossy()
             .replace('\\', "/");
-        let replacement = String::from(
-            "{\\setbeamercolor{background canvas}{bg=}\n\\includepdf[\n  pages=-,\n  pagecommand={\\smash{\\mbox{}}}\n]{",
-        ) + &frame_pdf
+        let replacement = frame_boundary_segment.to_owned()
+            + "{\\setbeamercolor{background canvas}{bg=}\n\\includepdf[\n  pages=-,\n  pagecommand={\\smash{\\hbox to 0pt{\\phantom{.}\\hss}}}\n]{"
+            + &frame_pdf
             + "}\n}";
         append_united_frame_placeholder(
             &mut united_tex,
@@ -415,7 +447,7 @@ fn build_united_document(
         united_tex,
         FrameSyncTexMap {
             source_file: original_source_path.to_path_buf(),
-            temp_file_name: String::from("faster-beamer-united.tex"),
+            temp_file_name: format!("{}preview.tex", UNITED_TEMP_PREFIX),
             segments,
         },
     ))
@@ -429,6 +461,170 @@ fn tex_input_name(path: &Path) -> &str {
 
 fn default_output_file(input_path: &Path) -> String {
     input_path.with_extension("pdf").to_string_lossy().into_owned()
+}
+
+fn frame_temp_file_name(hash: &md5::Digest) -> String {
+    format!("{}{:x}.tex", FRAME_TEMP_PREFIX, hash)
+}
+
+fn preamble_job_name(preamble_hash: &md5::Digest, is_draft: bool) -> String {
+    format!("{}{:x}_{}", PREAMBLE_TEMP_PREFIX, preamble_hash, is_draft)
+}
+
+fn current_cache_paths(input_file: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let cwd = current_dir().unwrap();
+    let input_path = Path::new(input_file);
+    let input_dir = input_path
+        .parent()
+        .unwrap_or(&cwd)
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_owned());
+    let cachedir = dirs::cache_dir().expect("This OS is not supported").join("faster-beamer");
+    let cache_subdir = cache_path(&cachedir, &input_dir);
+
+    (input_dir, cachedir, cache_subdir)
+}
+
+fn is_hex_digest(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn is_legacy_frame_temp_file(path: &Path, file_name: &str) -> bool {
+    match file_name.strip_suffix(".tex") {
+        Some(stem) if is_hex_digest(stem) => {}
+        _ => return false,
+    }
+
+    std::fs::read_to_string(path)
+        .map(|content| content.contains("\\addtocounter{framenumber}") && content.contains("\\end{document}"))
+        .unwrap_or(false)
+}
+
+fn is_legacy_preamble_temp_file(file_name: &str) -> bool {
+    for extension in [".fmt", ".log"] {
+        if let Some(stem) = file_name.strip_suffix(extension) {
+            let mut parts = stem.rsplitn(2, '_');
+            let draft_flag = parts.next();
+            let digest = parts.next();
+            if matches!(draft_flag, Some("true") | Some("false")) && digest.map(is_hex_digest).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn clean_prefixed_files(input_dir: &Path) -> Result<usize> {
+    let mut removed = 0;
+    let entries = std::fs::read_dir(input_dir).map_err(|err| {
+        error!("Failed to read input directory {}: {}", input_dir.display(), err);
+        FasterBeamerError::IoError
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            error!("Failed to inspect input directory {}: {}", input_dir.display(), err);
+            FasterBeamerError::IoError
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        if file_name.starts_with(FRAME_TEMP_PREFIX)
+            || file_name.starts_with(PREAMBLE_TEMP_PREFIX)
+            || file_name.starts_with(UNITED_TEMP_PREFIX)
+            || is_legacy_frame_temp_file(&path, file_name)
+            || is_legacy_preamble_temp_file(file_name)
+        {
+            std::fs::remove_file(&path).map_err(|err| {
+                error!("Failed to remove temporary file {}: {}", path.display(), err);
+                FasterBeamerError::IoError
+            })?;
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+fn prune_empty_cache_dirs(cache_dir: &Path, cache_subdir: &Path) {
+    let mut current = cache_subdir.parent();
+    while let Some(dir) = current {
+        if dir == cache_dir {
+            break;
+        }
+
+        match std::fs::remove_dir(dir) {
+            Ok(_) => current = dir.parent(),
+            Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => break,
+            Err(err) => {
+                warn!("Failed to prune empty cache directory {}: {}", dir.display(), err);
+                break;
+            }
+        }
+    }
+}
+
+pub fn clean_generated_artifacts(input_file: &str, args: &ArgMatches) -> Result<()> {
+    let input_path = Path::new(input_file);
+    if !input_path.is_file() {
+        error!("Could not open {}", input_file);
+        return Err(FasterBeamerError::InputFileNotExistent);
+    }
+
+    let (input_dir, cachedir, cache_subdir) = current_cache_paths(input_file);
+    let output_file = output_file_arg(args, input_path);
+    let removed_input_files = clean_prefixed_files(&input_dir)?;
+
+    if cache_subdir.is_dir() {
+        std::fs::remove_dir_all(&cache_subdir).map_err(|err| {
+            error!("Failed to remove cache directory {}: {}", cache_subdir.display(), err);
+            FasterBeamerError::IoError
+        })?;
+        prune_empty_cache_dirs(&cachedir, &cache_subdir);
+    }
+
+    clear_published_synctex(&output_file);
+    info!(
+        "Removed faster-beamer artifacts for {} ({} stale source temp files).",
+        input_file,
+        removed_input_files
+    );
+
+    Ok(())
+}
+
+fn output_file_arg(args: &ArgMatches, input_path: &Path) -> String {
+    args.value_of("output")
+        .or_else(|| args.value_of("OUTPUT"))
+        .map(|output| output.to_owned())
+        .unwrap_or_else(|| default_output_file(input_path))
+}
+
+fn compiler_options(args: &ArgMatches) -> Vec<String> {
+    args.values_of("compiler-option")
+        .map(|values| values.map(|value| value.to_owned()).collect())
+        .unwrap_or_default()
+}
+
+fn parallel_job_count(args: &ArgMatches) -> Option<usize> {
+    args.value_of("jobs")
+        .and_then(|count| count.parse::<usize>().ok())
+}
+
+fn apply_compiler_options(mut compiler: LatexCompiler, compiler_options: &[String]) -> LatexCompiler {
+    for option in compiler_options {
+        compiler = compiler.add_arg(option);
+    }
+
+    compiler
 }
 
 fn bibliography_tool(args: &ArgMatches) -> Option<BibliographyTool> {
@@ -454,26 +650,20 @@ fn latex_run_options(latex_pass_count: usize, bibliography: Option<BibliographyT
 }
 
 pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
-    let cwd = current_dir().unwrap();
     let input_path = Path::new(&input_file);
-    let input_dir = input_path
-        .parent()
-        .unwrap_or(&cwd)
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.to_owned());
+    let (input_dir, cachedir, cache_subdir) = current_cache_paths(input_file);
     let original_source_path = input_path
         .canonicalize()
         .unwrap_or_else(|_| input_dir.join(tex_input_name(input_path)));
-    let output_file = args
-        .value_of("OUTPUT")
-        .map(|output| output.to_owned())
-        .unwrap_or_else(|| default_output_file(input_path));
+    let output_file = output_file_arg(args, input_path);
     let correct_frame_numbers = args.is_present("frame-numbers");
     let latex_pass_count = latex_pass_count(args);
     let bibliography = bibliography_tool(args);
     let run_options = latex_run_options(latex_pass_count, bibliography);
     let force_recompile = args.is_present("force-recompile");
-    let use_parallel = args.is_present("parallel");
+    let compiler_options = compiler_options(args);
+    let parallel_job_count = parallel_job_count(args);
+    let use_parallel = args.is_present("parallel") || parallel_job_count.is_some();
 
     if !input_path.is_file() {
         error!("Could not open {}", input_file);
@@ -555,13 +745,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     }
     .unwrap_or_else(|| r"\documentclass[aspectratio=43,c,xcolor=dvipsnames]{beamer}".to_string());
 
-    let cachedir = dirs::cache_dir().expect("This OS is not supported").join("faster-beamer");
     std::fs::create_dir_all(&cachedir).map_err(|ref err| {
         error!("Failed to create cache dir \"{}\": {}", cachedir.display(), err);
         FasterBeamerError::IoError
     })?;
 
-    let cache_subdir = cache_path(&cachedir, &input_dir);
     std::fs::create_dir_all(&cache_subdir).map_err(|ref err| {
         error!(
             "Failed to create cache subdir \"{}\": {}",
@@ -581,12 +769,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .rfind("\\end{document}")
         .map(|idx| line_number_at(&parsed_file.file_content, idx))
         .unwrap_or(document_begin_line);
-    let preamble_filename = format!("{:x}_{}", preamble_hash, args.is_present("draft"));
-    if input_path
-        .parent()
-        .unwrap()
-        .join(format!("{}.fmt", preamble_filename))
-        .is_file()
+    let preamble_filename = preamble_job_name(&preamble_hash, args.is_present("draft"));
+    if input_dir.join(format!("{}.fmt", preamble_filename)).is_file()
     {
         info!("Precompiled preamble already exists");
     } else {
@@ -594,15 +778,17 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             "Precompiling preamble {:?}",
             input_path.join(format!("{}.fmt", preamble_filename))
         );
-        let output = Command::new("pdflatex")
+        let mut command = Command::new("pdflatex");
+        command
             .arg("-shell-escape")
             .arg("-ini")
             .arg(format!("-jobname={}", preamble_filename))
             .arg("&pdflatex")
-            .arg("mylatexformat.ltx")
-            .arg(tex_input_name(input_path))
-            .current_dir(&input_dir)
-            .output();
+            .arg("mylatexformat.ltx");
+        for option in &compiler_options {
+            command.arg(option);
+        }
+        let output = command.arg(tex_input_name(input_path)).current_dir(&input_dir).output();
         match output {
             Err(e) => {
                 log_command_error("pdflatex", "compile the preamble", &e);
@@ -643,7 +829,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         let compile_string = compile_prefix.clone() + &f + "\n\\end{document}\n";
 
         let hash = md5::compute(&compile_string);
-        let temp_file_name = format!("{:x}.tex", hash);
+        let temp_file_name = frame_temp_file_name(&hash);
         let output = cache_subdir.join(format!("{:x}.pdf", hash));
         let temp_frame_start_line = logical_line_count(&compile_prefix) + 1;
         let temp_document_begin_line = logical_line_count(&(format_line.clone() + &preamble + "\n")) + 1;
@@ -702,7 +888,14 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         frames.len()
     );
 
-    let progress_bar = ProgressBar::new(generated_documents.len() as u64);
+    let mut seen_compile_jobs = HashSet::new();
+    let compile_targets: Vec<(usize, &GeneratedDocument)> = generated_documents
+        .iter()
+        .enumerate()
+        .filter(|(_, document)| seen_compile_jobs.insert(document.sync_map.temp_file_name.clone()))
+        .collect();
+
+    let progress_bar = ProgressBar::new(compile_targets.len() as u64);
     let latex_input = LatexInput::new();
 
     let compile_document = |frame_idx: usize, document: &GeneratedDocument| {
@@ -714,10 +907,13 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 let temp_file = input_dir.join(&document.sync_map.temp_file_name);
 
                 if write(&temp_file, &document.tex_content).is_ok() {
-                    let compiler = LatexCompiler::new_in(cache_subdir.clone())
-                        .add_arg("-shell-escape")
-                        .add_arg("-interaction=nonstopmode")
-                        .with_current_dir(input_dir.clone());
+                    let compiler = apply_compiler_options(
+                        LatexCompiler::new_in(cache_subdir.clone())
+                            .add_arg("-shell-escape")
+                            .add_arg("-interaction=nonstopmode")
+                            .with_current_dir(input_dir.clone()),
+                        &compiler_options,
+                    );
 
                     let result = compiler.run(
                         Path::new(tex_input_name(&temp_file)),
@@ -744,15 +940,25 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         };
 
     if use_parallel {
-        generated_documents
-            .par_iter()
-            .enumerate()
-            .for_each(|(frame_idx, document)| compile_document(frame_idx, document));
+        if let Some(job_count) = parallel_job_count {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(job_count)
+                .build()
+                .expect("Failed to build the compile thread pool")
+                .install(|| {
+                    compile_targets
+                        .par_iter()
+                        .for_each(|(frame_idx, document)| compile_document(*frame_idx, document));
+                });
+        } else {
+            compile_targets
+                .par_iter()
+                .for_each(|(frame_idx, document)| compile_document(*frame_idx, document));
+        }
     } else {
-        generated_documents
+        compile_targets
             .iter()
-            .enumerate()
-            .for_each(|(frame_idx, document)| compile_document(frame_idx, document));
+            .for_each(|(frame_idx, document)| compile_document(*frame_idx, document));
     }
     progress_bar.finish_and_clear();
 
@@ -790,7 +996,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     } else if args.is_present("unite") {
         info!("Pasting precompiled frames into original document!");
 
-        let (united_tex, united_sync_map) = build_united_document(
+        let (united_tex, mut united_sync_map) = build_united_document(
             &parsed_file.file_content,
             &frames,
             &frame_source_lines,
@@ -799,14 +1005,24 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             &original_source_path,
         )?;
 
-        let united_tex_file = input_dir.join("faster-beamer-united.tex");
-        let united_pdf = cache_subdir.join("faster-beamer-united.pdf");
+        let united_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let united_job_name = format!("{}{}", UNITED_TEMP_PREFIX, united_suffix);
+        united_sync_map.temp_file_name = format!("{}.tex", united_job_name);
+
+        let united_tex_file = input_dir.join(&united_sync_map.temp_file_name);
+        let united_pdf = cache_subdir.join(format!("{}.pdf", united_job_name));
         let write_result = write(&united_tex_file, united_tex);
         if write_result.is_ok() {
-            let compiler = LatexCompiler::new_in(cache_subdir)
-                .add_arg("-shell-escape")
-                .add_arg("-interaction=nonstopmode")
-                .with_current_dir(input_dir.clone());
+            let compiler = apply_compiler_options(
+                LatexCompiler::new_in(cache_subdir)
+                    .add_arg("-shell-escape")
+                    .add_arg("-interaction=nonstopmode")
+                    .with_current_dir(input_dir.clone()),
+                &compiler_options,
+            );
 
             let compile_result = compiler.run(
                 Path::new(tex_input_name(&united_tex_file)),
