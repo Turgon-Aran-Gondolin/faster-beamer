@@ -19,6 +19,10 @@ use std::path::Path;
 use std::{thread, time};
 use process_file::FasterBeamerError;
 
+fn watch_label(input_file: &str) -> String {
+    format!("Watch: monitoring {}", input_file)
+}
+
 fn main() {
     if env::var("RUST_LOG").is_err() {
         let mut builder = pretty_env_logger::formatted_builder();
@@ -163,7 +167,7 @@ fn main() {
         .canonicalize()
         .unwrap_or_else(|_| cwd.to_owned());
 
-    info!("Processing {:?}.", input_file);
+    info!("Build requested: {}", input_file);
     if matches.is_present("clean") {
         let result = process_file::clean_generated_artifacts(input_file, &matches);
         if result == Err(FasterBeamerError::InputFileNotExistent) || result == Err(FasterBeamerError::IoError) {
@@ -191,7 +195,7 @@ fn main() {
                     match (Path::new(&input_file).canonicalize(), file.canonicalize()) {
                         (Ok(file), Ok(changed_file)) if file == changed_file => {
                             let path_str = file.to_str().unwrap();
-                            info!("Processing {:?}.", &path_str);
+                            info!("Rebuild triggered: source changed at {}", &path_str);
                             let _result = process_file::process_file(path_str, &matches);
                         }
                         _ => {}
@@ -202,8 +206,7 @@ fn main() {
                 }
             })
             .expect("Failed to watch file!");
-        info!("Watch mode");
-        info!("Watching {}", input_file);
+        info!("{}", watch_label(input_file));
 
         loop {
             thread::sleep(time::Duration::from_millis(100));
