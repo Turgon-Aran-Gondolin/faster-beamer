@@ -88,6 +88,14 @@ const FRAME_TEMP_PREFIX: &str = "faster-beamer-temp-";
 const PREAMBLE_TEMP_PREFIX: &str = "faster-beamer-preamble-";
 const UNITED_TEMP_PREFIX: &str = "faster-beamer-united-";
 
+fn frame_counter_setup(frame_idx: usize, correct_frame_numbers: bool) -> String {
+    if correct_frame_numbers {
+        format!("\\setcounter{{framenumber}}{{{}}}\n", frame_idx)
+    } else {
+        String::new()
+    }
+}
+
 fn show_error_slide(cachedir: &Path, output_file: &str) {
     let error_frame = String::from_utf8_lossy(include_bytes!("error.tex")).to_owned();
     let error_file = cachedir.join("error.tex");
@@ -367,6 +375,17 @@ fn append_united_frame_placeholder(
     *current_temp_line += line_count;
 }
 
+fn united_frame_replacement(frame_boundary_segment: &str, frame_pdf: &str) -> String {
+    frame_boundary_segment.to_owned()
+        + "{\\setbeamercolor{background canvas}{bg=}\n"
+        + "\\setbeamertemplate{footline}{}\n"
+        + "\\setbeamertemplate{headline}{}\n"
+        + "\\setbeamertemplate{navigation symbols}{}\n"
+        + "\\includepdf[\n  pages=-,\n  pagecommand={\\thispagestyle{empty}\\smash{\\hbox to 0pt{\\phantom{.}\\hss}}}\n]{"
+        + frame_pdf
+        + "}\n}"
+}
+
 fn build_united_document(
     source_content: &str,
     frames: &[String],
@@ -407,10 +426,7 @@ fn build_united_document(
         let frame_pdf = compiled_pdf_path(cache_subdir, &document.sync_map.temp_file_name)
             .to_string_lossy()
             .replace('\\', "/");
-        let replacement = frame_boundary_segment.to_owned()
-            + "{\\setbeamercolor{background canvas}{bg=}\n\\includepdf[\n  pages=-,\n  pagecommand={\\smash{\\hbox to 0pt{\\phantom{.}\\hss}}}\n]{"
-            + &frame_pdf
-            + "}\n}";
+        let replacement = united_frame_replacement(frame_boundary_segment, &frame_pdf);
         frame_path_segments.push((frame_pdf, *source_frame_start_line));
         append_united_frame_placeholder(
             &mut united_tex,
@@ -829,15 +845,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .enumerate()
     {
         let format_line = format!("%&{}\n", preamble_filename);
-        let counter_setup = if correct_frame_numbers {
-            format!(
-                "\\setcounter{{framenumber}}{{{}}}\n\\setcounter{{page}}{{{}}}\n",
-                frame_idx,
-                frame_idx + 1,
-            )
-        } else {
-            String::new()
-        };
+        let counter_setup = frame_counter_setup(frame_idx, correct_frame_numbers);
         let compile_prefix = format_line.clone() + &preamble + "\n\\begin{document}\n" + &counter_setup;
         let compile_string = compile_prefix.clone() + &f + "\n\\end{document}\n";
 
@@ -1092,4 +1100,30 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
     *PREVIOUS_FRAMES.lock().unwrap() = frames;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_counter_setup;
+    use super::united_frame_replacement;
+
+    #[test]
+    fn frame_number_setup_only_sets_framenumber() {
+        assert_eq!(frame_counter_setup(3, true), "\\setcounter{framenumber}{3}\n");
+    }
+
+    #[test]
+    fn frame_number_setup_is_empty_when_disabled() {
+        assert_eq!(frame_counter_setup(3, false), "");
+    }
+
+    #[test]
+    fn united_frame_replacement_suppresses_wrapper_templates() {
+        let replacement = united_frame_replacement("", "frame.pdf");
+
+        assert!(replacement.contains("\\setbeamertemplate{footline}{}"));
+        assert!(replacement.contains("\\setbeamertemplate{headline}{}"));
+        assert!(replacement.contains("\\setbeamertemplate{navigation symbols}{}"));
+        assert!(replacement.contains("pagecommand={\\thispagestyle{empty}"));
+    }
 }
