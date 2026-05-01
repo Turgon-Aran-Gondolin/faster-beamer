@@ -1,0 +1,141 @@
+% Feature coverage for faster-beamer:
+% - explicit table of contents frame (useful to compare preview mode against --unite)
+% - \AtBeginSection roadmap frames generated from section hooks
+% - nested \input and \include dependencies
+% - \graphicspath + \includegraphics on a checked-in EPS asset
+% - fragile frame content, cross references, BibTeX, and TikZ
+%
+% Suggested runs:
+%   cargo run -- test/feature-tour.tex --unite --multi-pass=2 --bibliography bibtex --tree-sitter
+%   cargo run -- test/feature-tour.tex --watch --unite --multi-pass=2 --bibliography bibtex
+%   cargo run -- test/feature-tour.tex --output test/feature-tour-preview.pdf
+%
+% This commented line is intentional: the dependency scanner should ignore it.
+% \input{ignored-by-comment-stripper}
+
+\documentclass[aspectratio=169]{beamer}
+\usetheme{Madrid}
+\usecolortheme{seagull}
+
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{epstopdf}
+\usetikzlibrary{arrows.meta,calc,positioning}
+
+\graphicspath{{figures/}}
+
+\title{faster-beamer Feature Tour}
+\subtitle{Regression deck for preview, caching, and unite mode}
+\author{Repository fixture}
+\date{\today}
+
+\AtBeginSection[]
+{
+  \begin{frame}{Section Roadmap}
+    The section hook should create a roadmap slide whenever a new section starts.
+
+    \tableofcontents[currentsection]
+  \end{frame}
+}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Agenda}
+  This slide checks how explicit TOC content behaves in preview mode versus \texttt{--unite}.
+
+  \tableofcontents
+\end{frame}
+
+\section{Caching and Inputs}
+
+\begin{frame}{Input files and overlays}
+  \label{frm:nested-input}
+
+  \input{sections/intro-body}
+  \input{sections/details/intro-detail}
+\end{frame}
+
+\begin{frame}{Graphics, tables, and counters}
+  \label{frm:graphic}
+
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.58\textwidth}
+      \begin{itemize}
+        \item External graphic loaded through \texttt{\string\graphicspath}.
+        \item Table content that is easy to diff visually.
+        \item Label target for later cross references.
+      \end{itemize}
+
+      \begin{tabular}{@{}llr@{}}
+        \toprule
+        Feature & Mode & Status \\
+        \midrule
+        Cache & preview & fast \\
+        Unite & final & accurate \\
+        TOC & frame-only & inspect \\
+        \bottomrule
+      \end{tabular}
+    \end{column}
+    \begin{column}{0.38\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{faster-box}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}[fragile]{Fragile content}
+This frame checks extraction of verbatim-heavy content.
+
+\begin{verbatim}
+cargo run -- test/feature-tour.tex --watch --unite --multi-pass=2
+cargo run -- test/feature-tour.tex --frame-numbers --parallel --jobs 2
+\end{verbatim}
+\end{frame}
+
+\section{Cross References and TikZ}
+
+\begin{frame}{Cross references}
+The graphic slide is frame~\ref{frm:graphic}.
+The nested input slide is frame~\ref{frm:nested-input}.
+We also cite \cite{knuth1984texbook} here to exercise BibTeX.
+\end{frame}
+
+\begin{frame}{TikZ overview}
+  \centering
+  \begin{tikzpicture}[>=Latex, node distance=22mm]
+    \node[draw, rounded corners, fill=blue!10] (source) {Source .tex};
+    \node[draw, rounded corners, right=of source, fill=green!10] (cache) {Cached frame PDFs};
+    \node[draw, rounded corners, right=of cache, fill=orange!15] (output) {Preview / united PDF};
+
+    \draw[->, thick] (source) -- node[above] {parse} (cache);
+    \draw[->, thick] (cache) -- node[above] {publish} (output);
+    \draw[->, dashed, bend left=25] (source.north) to node[above] {sections + TOC} (output.north);
+  \end{tikzpicture}
+
+  \vspace{1em}
+  Cross references and some TikZ setups are a good reason to run with \texttt{--multi-pass=2}.
+\end{frame}
+
+\section{Included File}
+
+\include{include-demo}
+
+\appendix
+\section{Appendix}
+
+\input{sections/appendix-note}
+
+\begin{frame}[allowframebreaks]{References}
+  This frame stays non-empty even when BibTeX is disabled, which keeps united-mode PDF inclusion valid.
+
+  \bibliographystyle{plain}
+  \bibliography{refs}
+\end{frame}
+
+\end{document}

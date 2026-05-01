@@ -1,0 +1,12 @@
+This frame pulls content from multiple external input files.
+
+\begin{itemize}
+  \item The first-level content lives in \texttt{sections/intro-body.tex}.
+  \item Another root-relative \texttt{\string\input} follows right after this block.
+\end{itemize}
+
+\pause
+
+\begin{block}{Why this matters}
+Editing either input file should invalidate this frame and refresh the cached PDF.
+\end{block}
