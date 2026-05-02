@@ -71,11 +71,57 @@ struct GeneratedDocument {
     tex_content: String,
     sync_map: FrameSyncTexMap,
     dependencies: Vec<PathBuf>,
+    support_files: Vec<GeneratedSupportFile>,
+}
+
+struct GeneratedSupportFile {
+    extension: &'static str,
+    content: String,
+}
+
+struct SourceSection {
+    line_number: usize,
+    number: usize,
+    title: String,
+    is_appendix: bool,
+}
+
+struct TocFramePatch {
+    runtime_setup: String,
+    support_files: Vec<GeneratedSupportFile>,
+    additional_dependencies: Vec<PathBuf>,
+}
+
+enum TocFrameSupport {
+    None,
+    Supported(TocFramePatch),
+    UnsupportedDynamic,
 }
 
 lazy_static! {
     static ref FRAME_REGEX: Regex =
         Regex::new(r"(?ms)^[ \t]*\\begin\{frame\}.*?^[ \t]*\\end\{frame\}").unwrap();
+}
+lazy_static! {
+    static ref SECTION_LINE_REGEX: Regex = Regex::new(
+        r"(?x)
+        ^[ \t]*
+        \\section
+        (?:\s*\[[^\]]*\])?
+        \s*\{(?P<title>[^}]*)\}
+    "
+    )
+    .unwrap();
+}
+lazy_static! {
+    static ref APPENDIX_LINE_REGEX: Regex = Regex::new(r"^[ \t]*\\appendix\b").unwrap();
+}
+lazy_static! {
+    static ref TOC_REGEX: Regex = Regex::new(r"\\tableofcontents(?:\s*\[[^\]]*\])?").unwrap();
+}
+lazy_static! {
+    static ref DYNAMIC_TOC_OPTION_REGEX: Regex =
+        Regex::new(r"\\tableofcontents\s*\[[^\]]*(?:currentsection|currentsubsection)[^\]]*\]").unwrap();
 }
 lazy_static! {
     static ref DOCUMENT_REGEX: Regex =
@@ -382,6 +428,114 @@ fn strip_tex_comments(tex: &str) -> String {
     }
 
     stripped
+}
+
+fn frame_contains_table_of_contents(frame: &str) -> bool {
+    TOC_REGEX.is_match(&strip_tex_comments(frame))
+}
+
+fn table_of_contents_uses_dynamic_section_context(frame: &str) -> bool {
+    DYNAMIC_TOC_OPTION_REGEX.is_match(&strip_tex_comments(frame))
+}
+
+fn document_sections(source_content: &str) -> Vec<SourceSection> {
+    let stripped = strip_tex_comments(source_content);
+    let mut sections = Vec::new();
+    let mut is_appendix = false;
+
+    for (line_idx, line) in stripped.lines().enumerate() {
+        if APPENDIX_LINE_REGEX.is_match(line) {
+            is_appendix = true;
+        }
+
+        if let Some(captures) = SECTION_LINE_REGEX.captures(line) {
+            let title = captures
+                .name("title")
+                .map(|capture| capture.as_str().trim().to_string())
+                .unwrap_or_default();
+            sections.push(SourceSection {
+                line_number: line_idx + 1,
+                number: sections.len() + 1,
+                title,
+                is_appendix,
+            });
+        }
+    }
+
+    sections
+}
+
+fn current_section_number(sections: &[SourceSection], frame_start_line: usize) -> usize {
+    sections
+        .iter()
+        .rev()
+        .find(|section| section.line_number < frame_start_line)
+        .map(|section| section.number)
+        .unwrap_or(0)
+}
+
+fn synthetic_toc_content(sections: &[SourceSection]) -> String {
+    let mut content = String::new();
+
+    for section in sections {
+        content.push_str(&format!(
+            "\\beamer@sectionintoc {{{}}}{{{}}}{{{}}}{{{}}}{{{}}}\n",
+            section.number,
+            section.title,
+            section.number,
+            if section.is_appendix { 1 } else { 0 },
+            section.number,
+        ));
+    }
+
+    content
+}
+
+fn toc_frame_patch(
+    frame: &str,
+    source_frame_start_line: usize,
+    document_begin_line: usize,
+    input_dir: &Path,
+    input_path: &Path,
+    sections: &[SourceSection],
+) -> TocFrameSupport {
+    if !frame_contains_table_of_contents(frame) {
+        return TocFrameSupport::None;
+    }
+
+    if source_frame_start_line < document_begin_line
+        && table_of_contents_uses_dynamic_section_context(frame)
+    {
+        return TocFrameSupport::UnsupportedDynamic;
+    }
+
+    let source_toc_path = input_dir.join(Path::new(tex_input_name(input_path)).with_extension("toc"));
+    let mut additional_dependencies = Vec::new();
+    let toc_content = match fs::read_to_string(&source_toc_path) {
+        Ok(content) => {
+            additional_dependencies.push(source_toc_path);
+            content
+        }
+        Err(_) => synthetic_toc_content(sections),
+    };
+
+    let current_section = if table_of_contents_uses_dynamic_section_context(frame) {
+        current_section_number(sections, source_frame_start_line)
+    } else {
+        0
+    };
+
+    TocFrameSupport::Supported(TocFramePatch {
+        runtime_setup: format!(
+            "\\setcounter{{section}}{{{}}}\n\\setcounter{{subsection}}{{0}}\n",
+            current_section
+        ),
+        support_files: vec![GeneratedSupportFile {
+            extension: "toc",
+            content: toc_content,
+        }],
+        additional_dependencies,
+    })
 }
 
 fn is_static_path_reference(raw_path: &str) -> bool {
@@ -1275,7 +1429,9 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         };
     }
 
+    let source_sections = document_sections(&parsed_file.file_content);
     let mut generated_documents = Vec::new();
+    let mut unsupported_dynamic_toc_frames = 0usize;
     let mut command = Command::new("pdfunite");
     for (frame_idx, (f, (source_frame_start_line, frame_line_count))) in frames
         .iter()
@@ -1284,10 +1440,42 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     {
         let format_line = format!("%&{}\n", preamble_filename);
         let counter_setup = frame_counter_setup(frame_idx, correct_frame_numbers);
-        let compile_prefix = format_line.clone() + &preamble + "\n\\begin{document}\n" + &counter_setup;
+        let toc_frame_patch = toc_frame_patch(
+            f,
+            *source_frame_start_line,
+            document_begin_line,
+            &input_dir,
+            input_path,
+            &source_sections,
+        );
+        let (toc_runtime_setup, support_files, additional_dependencies) = match toc_frame_patch {
+            TocFrameSupport::None => (String::new(), Vec::new(), Vec::new()),
+            TocFrameSupport::Supported(patch) => (
+                patch.runtime_setup,
+                patch.support_files,
+                patch.additional_dependencies,
+            ),
+            TocFrameSupport::UnsupportedDynamic => {
+                unsupported_dynamic_toc_frames += 1;
+                (String::new(), Vec::new(), Vec::new())
+            }
+        };
+        let compile_prefix = format_line.clone()
+            + &preamble
+            + "\n\\begin{document}\n"
+            + &counter_setup
+            + &toc_runtime_setup;
         let compile_string = compile_prefix.clone() + &f + "\n\\end{document}\n";
 
-        let hash = md5::compute(&compile_string);
+        let mut hash_input = compile_string.clone();
+        for support_file in &support_files {
+            hash_input.push_str(support_file.extension);
+            hash_input.push('\n');
+            hash_input.push_str(&support_file.content);
+            hash_input.push('\n');
+        }
+
+        let hash = md5::compute(&hash_input);
         let temp_file_name = frame_temp_file_name(&hash);
         let output = compiled_pdf_path(&cache_subdir, &temp_file_name);
         let temp_frame_start_line = logical_line_count(&compile_prefix) + 1;
@@ -1317,7 +1505,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             line_count: 1,
             source_start_line: document_end_line,
         });
-        let dependencies = collect_related_files(&compile_string, &input_dir);
+        let mut dependencies = collect_related_files(&compile_string, &input_dir);
+        dependencies.extend(additional_dependencies);
+        dependencies.sort();
+        dependencies.dedup();
 
         generated_documents.push(GeneratedDocument {
             hash,
@@ -1328,9 +1519,19 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 segments,
             },
             dependencies,
+            support_files,
         });
 
         command.arg(&output);
+    }
+
+    if unsupported_dynamic_toc_frames > 0 {
+        warn!(
+            "Detected {} dynamic Beamer TOC frame(s) that faster-beamer cannot render correctly as cached per-frame PDFs (for example \\AtBeginSection with \\tableofcontents[currentsection]). The build will continue, but the proper workflow is a full document compile such as: pdflatex -interaction=nonstopmode -halt-on-error {} ; pdflatex -interaction=nonstopmode -halt-on-error {} (and run bibtex/biber between passes if needed).",
+            unsupported_dynamic_toc_frames,
+            tex_input_name(input_path),
+            tex_input_name(input_path),
+        );
     }
 
     trace!("Comparing frames");
@@ -1401,8 +1602,25 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
             } else {
                 let temp_file = input_dir.join(&document.sync_map.temp_file_name);
+                let mut support_paths = Vec::new();
 
                 if write(&temp_file, &document.tex_content).is_ok() {
+                    for support_file in &document.support_files {
+                        let support_path = cache_subdir.join(
+                            Path::new(&document.sync_map.temp_file_name)
+                                .with_extension(support_file.extension),
+                        );
+
+                        match write(&support_path, &support_file.content) {
+                            Ok(_) => support_paths.push(support_path),
+                            Err(err) => warn!(
+                                "Failed to write temporary support file {}: {}",
+                                support_path.display(),
+                                err
+                            ),
+                        }
+                    }
+
                     let compiler = apply_compiler_options(
                         LatexCompiler::new_in(cache_subdir.clone())
                             .add_arg("-shell-escape")
@@ -1410,11 +1628,18 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                             .with_current_dir(input_dir.clone()),
                         &compiler_options,
                     );
+                    let document_run_options = if document.support_files.is_empty() {
+                        run_options
+                    } else {
+                        run_options
+                            .with_latex_pass_count(1)
+                            .with_bibliography_tool(None)
+                    };
 
                     let result = compiler.run(
                         Path::new(tex_input_name(&temp_file)),
                         &latex_input,
-                        run_options,
+                        document_run_options,
                     );
                     if result.is_ok() {
                         if update_dependency_manifest(&cache_subdir, &document.sync_map.temp_file_name).is_err() {
@@ -1426,8 +1651,26 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         if let Err(err) = std::fs::remove_file(&temp_file) {
                             warn!("Failed to remove temporary frame source {}: {}", temp_file.display(), err);
                         }
+                        for support_path in &support_paths {
+                            if let Err(err) = std::fs::remove_file(support_path) {
+                                warn!(
+                                    "Failed to remove temporary support file {}: {}",
+                                    support_path.display(),
+                                    err
+                                );
+                            }
+                        }
                         trace!("Compiled file {}", &temp_file.to_str().unwrap());
                     } else {
+                        for support_path in &support_paths {
+                            if let Err(err) = std::fs::remove_file(support_path) {
+                                warn!(
+                                    "Failed to remove temporary support file {}: {}",
+                                    support_path.display(),
+                                    err
+                                );
+                            }
+                        }
                         error!(
                             "Failed to compile frame {} ({})",
                             frame_idx,
@@ -1599,11 +1842,14 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::collect_related_files;
+    use super::document_sections;
     use super::first_changed_frame_index;
     use super::frame_counter_setup;
+    use super::toc_frame_patch;
     use super::united_frame_replacement;
     use super::FrameSyncTexMap;
     use super::GeneratedDocument;
+    use super::TocFrameSupport;
     use std::fs;
     use std::thread;
     use std::time::Duration;
@@ -1682,6 +1928,43 @@ mod tests {
     }
 
     #[test]
+    fn toc_frame_patch_generates_synthetic_toc_for_document_frame() {
+        let temp_dir = tempdir().unwrap();
+        let input_path = temp_dir.path().join("slides.tex");
+        fs::write(&input_path, "\\documentclass{beamer}\n\\begin{document}\n").unwrap();
+
+        let source = "\\documentclass{beamer}\n\\begin{document}\n\\section{Intro}\n\\begin{frame}{Agenda}\n\\tableofcontents\n\\end{frame}\n\\section{Next}\n\\end{document}\n";
+        let sections = document_sections(source);
+        let frame = "\\begin{frame}{Agenda}\n\\tableofcontents\n\\end{frame}";
+
+        match toc_frame_patch(frame, 4, 2, temp_dir.path(), &input_path, &sections) {
+            TocFrameSupport::Supported(patch) => {
+                assert!(patch.runtime_setup.contains("\\setcounter{section}{0}"));
+                assert_eq!(patch.support_files.len(), 1);
+                assert!(patch.support_files[0].content.contains("\\beamer@sectionintoc {1}{Intro}"));
+                assert!(patch.support_files[0].content.contains("\\beamer@sectionintoc {2}{Next}"));
+            }
+            _ => panic!("expected supported TOC frame patch"),
+        }
+    }
+
+    #[test]
+    fn toc_frame_patch_marks_dynamic_preamble_toc_as_unsupported() {
+        let temp_dir = tempdir().unwrap();
+        let input_path = temp_dir.path().join("slides.tex");
+        fs::write(&input_path, "\\documentclass{beamer}\n").unwrap();
+
+        let source = "\\documentclass{beamer}\n\\AtBeginSection[]{\\begin{frame}\\tableofcontents[currentsection]\\end{frame}}\n\\begin{document}\n\\section{Intro}\n\\end{document}\n";
+        let sections = document_sections(source);
+        let frame = "\\begin{frame}\\tableofcontents[currentsection]\\end{frame}";
+
+        assert!(matches!(
+            toc_frame_patch(frame, 2, 3, temp_dir.path(), &input_path, &sections),
+            TocFrameSupport::UnsupportedDynamic
+        ));
+    }
+
+    #[test]
     fn parse_fls_dependencies_ignores_generated_temp_files() {
         let temp_dir = tempdir().unwrap();
         let cache_dir = temp_dir.path().join("cache");
@@ -1734,6 +2017,7 @@ mod tests {
                 segments: Vec::new(),
             },
             dependencies: vec![dependency],
+            support_files: Vec::new(),
         }];
 
         let first_changed = first_changed_frame_index(
