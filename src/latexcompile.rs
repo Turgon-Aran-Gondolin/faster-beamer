@@ -50,6 +50,8 @@
 //!
 
 use crate::fs_utils::{stage_directory_into, stage_file_into};
+use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -98,15 +100,31 @@ impl LatexRunOptions {
     }
 }
 
-/// Specify all error cases with the fail api.
-#[derive(Fail, Debug)]
+/// Specify all error cases for the LaTeX wrapper.
+#[derive(Debug)]
 pub enum LatexError {
-    #[fail(display = "General failure: {}.", _0)]
     LatexError(String),
-    #[fail(display = "Failed to convert input {}", _0)]
-    Input(#[cause] std::io::Error),
-    #[fail(display = "{}", _0)]
-    Io(#[cause] std::io::Error),
+    Input(std::io::Error),
+    Io(std::io::Error),
+}
+
+impl fmt::Display for LatexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LatexError(message) => write!(f, "General failure: {}.", message),
+            Self::Input(err) => write!(f, "Failed to convert input {}", err),
+            Self::Io(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl Error for LatexError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Input(err) | Self::Io(err) => Some(err),
+            Self::LatexError(_) => None,
+        }
+    }
 }
 
 /// result type alias idiom
@@ -176,6 +194,7 @@ impl LatexInput {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn add_file_lazy(&mut self, file: PathBuf, dest_path: &Path) -> Result<()> {
         if file.is_file() {
             stage_file_into(dest_path, &file).map_err(LatexError::Io)?;
@@ -183,6 +202,7 @@ impl LatexInput {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn add_folder_lazy(&mut self, folder: PathBuf, dest_path: &Path) -> Result<()> {
         if folder.is_dir() {
             stage_directory_into(dest_path, &folder).map_err(LatexError::Io)?;
@@ -190,6 +210,7 @@ impl LatexInput {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn from_lazy(path: &Path, dest_path: &Path) -> Result<LatexInput> {
         let mut input = LatexInput::new();
         let paths = fs::read_dir(path).map_err(LatexError::Input)?;
@@ -249,6 +270,7 @@ pub struct LatexCompiler {
 
 impl LatexCompiler {
     /// Create a new latex compiler wrapper
+    #[allow(dead_code)]
     pub fn new() -> Result<LatexCompiler> {
         let dir = tempdir().map_err(LatexError::Io)?;
         Ok(Self::new_in(dir.path().to_path_buf()))

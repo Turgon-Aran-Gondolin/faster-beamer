@@ -13,7 +13,6 @@ extern "C" {
 }
 
 pub struct ParsedFile {
-    pub filename: String,
     pub file_content: String,
     pub syntax_tree: tree_sitter::Tree,
 }
@@ -24,7 +23,7 @@ impl ParsedFile {
         ParsedFile::from_string(filename, file_content)
     }
 
-    pub fn from_string(filename: String, file_content: String) -> ParsedFile {
+    pub fn from_string(_filename: String, file_content: String) -> ParsedFile {
         let mut parser = Parser::new();
         let language = unsafe { tree_sitter_latex() };
 
@@ -34,13 +33,12 @@ impl ParsedFile {
             .parse(&file_content, None)
             .expect("Failed to parse file");
         ParsedFile {
-            filename,
             file_content,
             syntax_tree: tree,
         }
     }
 
-    pub fn get_nodes_of_type(&self, node_type: String) -> Vec<Node> {
+    pub fn get_nodes_of_type(&self, node_type: &str) -> Vec<Node<'_>> {
         let root_node = self.syntax_tree.root_node();
         get_nodes_of_type(root_node, node_type, false)
     }
@@ -60,7 +58,7 @@ mod tests {
         let languages = vec![unsafe { tree_sitter_latex() }];
 
         for l in languages {
-            for i in 0..l.node_kind_count() {
+            for _i in 0..l.node_kind_count() {
                 //println!("{}", l.node_kind_for_id(i as u16));
             }
         }

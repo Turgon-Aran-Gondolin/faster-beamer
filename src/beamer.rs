@@ -8,10 +8,10 @@ use crate::parsing::ParsedFile;
 use crate::tree_traversal::{get_children, TraversalOrder};
 use tree_sitter::Node;
 
-pub fn get_frames(parsed_file: &ParsedFile) -> Vec<Node> {
+pub fn get_frames(parsed_file: &ParsedFile) -> Vec<Node<'_>> {
     let mut frames = Vec::new();
 
-    let text_envs = parsed_file.get_nodes_of_type("text_env".to_string());
+    let text_envs = parsed_file.get_nodes_of_type("text_env");
 
     for t in text_envs {
         let children = get_children(
@@ -28,11 +28,7 @@ pub fn get_frames(parsed_file: &ParsedFile) -> Vec<Node> {
 }
 
 fn has_begin_frame(node: Node, parsed_file: &ParsedFile) -> bool {
-    node.kind() == "begin"
-        && parsed_file
-            .get_node_string(&node)
-            .to_string()
-            .contains("{frame}")
+    node.kind() == "begin" && parsed_file.get_node_string(&node).contains("{frame}")
 }
 
 #[cfg(test)]

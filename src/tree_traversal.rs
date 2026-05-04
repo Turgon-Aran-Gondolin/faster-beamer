@@ -10,14 +10,18 @@ pub enum TraversalOrder {
     BreadthFirst,
 }
 
-pub fn get_nodes_of_type(root_node: Node, node_type: String, return_first_only: bool) -> Vec<Node> {
+pub fn get_nodes_of_type<'a>(
+    root_node: Node<'a>,
+    node_type: &str,
+    return_first_only: bool,
+) -> Vec<Node<'a>> {
     let mut stack = vec![root_node];
     let mut results = Vec::new();
 
     while !stack.is_empty() {
         let current_node = stack.pop().unwrap();
 
-        if current_node.kind() == &node_type[..] {
+        if current_node.kind() == node_type {
             results.push(current_node);
             if return_first_only {
                 return results;

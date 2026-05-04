@@ -61,6 +61,7 @@ pub fn cache_path(root: &Path, path: &Path) -> PathBuf {
     root.join(cache_relative_path(path))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn stage_file_into(root: &Path, source: &Path) -> io::Result<PathBuf> {
     let dest = cache_path(root, source);
 
@@ -82,6 +83,7 @@ pub fn stage_file_into(root: &Path, source: &Path) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn stage_directory_into(root: &Path, source: &Path) -> io::Result<PathBuf> {
     let dest = cache_path(root, source);
 

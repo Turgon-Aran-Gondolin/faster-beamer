@@ -2,8 +2,6 @@
 extern crate log;
 #[macro_use]
 extern crate lazy_static;
-#[macro_use]
-extern crate failure_derive;
 
 mod beamer;
 mod fs_utils;

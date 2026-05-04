@@ -67,7 +67,6 @@ impl FrameSyncTexMap {
 }
 
 struct GeneratedDocument {
-    hash: md5::Digest,
     tex_content: String,
     sync_map: FrameSyncTexMap,
     dependencies: Vec<PathBuf>,
@@ -1511,7 +1510,6 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         dependencies.dedup();
 
         generated_documents.push(GeneratedDocument {
-            hash,
             tex_content: compile_string,
             sync_map: FrameSyncTexMap {
                 source_file: original_source_path.clone(),
@@ -2009,7 +2007,6 @@ mod tests {
         fs::write(&dependency, b"new figure").unwrap();
 
         let generated_documents = vec![GeneratedDocument {
-            hash: md5::compute("frame"),
             tex_content: String::new(),
             sync_map: FrameSyncTexMap {
                 source_file: temp_dir.path().join("slides.tex"),
