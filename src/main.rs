@@ -17,6 +17,8 @@ use std::path::Path;
 use std::{thread, time};
 use process_file::FasterBeamerError;
 
+const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
+
 fn watch_label(input_file: &str) -> String {
     format!("Watch: monitoring {}", input_file)
 }
@@ -34,40 +36,56 @@ fn main() {
         .version(option_env!("FASTER_BEAMER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))
         .author("Stephan Seitz <stephan.seitz@fau.de>")
         .about("Incremental compiler for Beamer LaTeX presentations")
+        .after_help(HELP_EPILOGUE)
         .arg(
             Arg::with_name("watch")
                 .short("w")
                 .long("watch")
-                .help("Watch the input file and rebuild on changes"),
+                .help("Watch the input file and rebuild when it changes"),
         )
         .arg(
             Arg::with_name("clean")
+                .short("c")
                 .long("clean")
                 .help("Remove faster-beamer cache, auxiliary files, and stale temporary files for the input"),
         )
         .arg(
             Arg::with_name("INPUT")
-                .help("Sets the input file to use")
+                .help("Input .tex file to compile")
                 .required(true)
                 .index(1),
         )
         .arg(
-            Arg::with_name("unite")
+            Arg::with_name("tex-unite")
                 .short("u")
-                .long("unite")
-                .help("Unites all slides to a PDF (default is only to output newest slide)"),
+                .long("tex-unite")
+                .alias("unite-synctex")
+                .visible_alias("unite")
+                .conflicts_with("pdfunite")
+                .conflicts_with("pdfunite-synctex")
+                .help("Compile a temporary united TeX document for the full deck and preserve SyncTeX"),
         )
         .arg(
             Arg::with_name("pdfunite")
                 .short("x")
                 .long("pdfunite")
-                .help("Unites all slides to a PDF using the optional pdfunite executable"),
+                .conflicts_with("tex-unite")
+                .conflicts_with("pdfunite-synctex")
+                .help("Concatenate frame PDFs with the external pdfunite executable; fastest full-deck mode, but published SyncTeX is removed"),
+        )
+        .arg(
+            Arg::with_name("pdfunite-synctex")
+                .short("X")
+                .long("pdfunite-synctex")
+                .conflicts_with("tex-unite")
+                .conflicts_with("pdfunite")
+                .help("Concatenate frame PDFs with pdfunite, then run a temporary united TeX build to publish SyncTeX"),
         )
         .arg(
             Arg::with_name("frame-numbers")
                 .short("f")
                 .long("frame-numbers")
-                .help("Try to print correct frames numbers. This can harm cache performance when swapping frames."),
+                .help("Preserve correct Beamer frame numbers. This can reduce cache reuse when frames move."),
         )
         .arg(
             Arg::with_name("tree-sitter")
@@ -126,12 +144,13 @@ fn main() {
         )
         .arg(
             Arg::with_name("compiler-option")
+                .short("C")
                 .long("compiler-option")
                 .takes_value(true)
                 .multiple(true)
                 .allow_hyphen_values(true)
                 .value_name("OPTION")
-                .help("Pass OPTION through to pdflatex for frame and united builds; may be supplied multiple times"),
+                .help("Pass OPTION through to pdflatex for preamble, frame, and united builds; may be supplied multiple times"),
         )
         .arg(
             Arg::with_name("output")
@@ -145,14 +164,9 @@ fn main() {
         )
         .arg(
             Arg::with_name("OUTPUT")
-                .help("Filename for output PDF (defaults to INPUT with a .pdf extension)")
+                .help("Optional positional alias for -o, --output FILE (defaults to INPUT with a .pdf extension)")
                 .index(2),
         )
-        //.arg(
-        //Arg::with_name("draft")
-        //.short("d")
-        //.help("Compile in draft mode")
-        //)
         .get_matches();
 
     let is_watch_mode = matches.is_present("watch");

@@ -30,11 +30,17 @@ If you want pdfunite to glue all the compiled frames together use:
 faster-beamer presentation.tex --watch --pdfunite
 ```
 
+If you want the final PDF from `pdfunite` but still need a published SyncTeX sidecar, use:
+
+```bash
+faster-beamer presentation.tex --watch --pdfunite-synctex
+```
+
 We can also try to reinsert the precompiled frames into the orginal document. 
 This will yield the most accurate result (including title, section pages). 
 
 ```bash
-faster-beamer presentation.tex --watch --unite
+faster-beamer presentation.tex --watch --tex-unite
 ```
 
 If your slides use TikZ or other content that needs more than one LaTeX pass, add `--multi-pass` or `-m`:
@@ -100,7 +106,7 @@ faster-beamer presentation.tex --compiler-option=-draftmode --compiler-option=-f
 
 - A Rust toolchain >= 3.39
 - A working `pdflatex` on `PATH`
-- `pdfunite` on `PATH` only if you want to use `--pdfunite`
+- `pdfunite` on `PATH` only if you want to use `--pdfunite` or `--pdfunite-synctex`
 - `bibtex` or `biber` on `PATH` when using `--bibliography`
 
 ## Windows notes
@@ -108,8 +114,9 @@ faster-beamer presentation.tex --compiler-option=-draftmode --compiler-option=-f
 - The first supported Windows target is `x86_64-pc-windows-msvc`.
 - Use TeX Live on Windows for the initial support path.
 - Install the MSVC Rust toolchain and the Visual C++ Build Tools needed to compile the vendored parser sources.
-- `--unite` is the more portable full-document mode on Windows.
+- `--tex-unite` is the more portable full-document mode on Windows.
 - `--pdfunite` remains optional and will fail with an actionable error if `pdfunite` is not installed.
+- `--pdfunite-synctex` keeps the final PDF from `pdfunite` and runs a temporary united TeX build only for SyncTeX.
 - If a PDF viewer keeps the output file locked, `faster-beamer` now reports that publish failure instead of relying on symlink replacement.
 
 ## Installation

@@ -79,6 +79,12 @@ struct GeneratedSupportFile {
     content: String,
 }
 
+struct UnitedCompileArtifacts {
+    tex_file: PathBuf,
+    pdf_file: PathBuf,
+    sync_map: FrameSyncTexMap,
+}
+
 struct FrameCompileFailure {
     frame_idx: usize,
     source_start_line: usize,
@@ -179,6 +185,7 @@ lazy_static! {
 const FRAME_TEMP_PREFIX: &str = "faster-beamer-temp-";
 const PREAMBLE_TEMP_PREFIX: &str = "faster-beamer-preamble-";
 const UNITED_TEMP_PREFIX: &str = "faster-beamer-united-";
+const PDFUNITE_TEMP_FILE: &str = "faster-beamer-pdfunite-output.pdf";
 const GRAPHICS_EXTENSIONS: [&str; 6] = ["pdf", "png", "jpg", "jpeg", "eps", "svg"];
 const DEPENDENCY_MANIFEST_EXTENSION: &str = "deps";
 
@@ -1106,10 +1113,12 @@ fn first_changed_frame_index(
 }
 
 fn build_mode_label(args: &ArgMatches) -> &'static str {
-    if args.is_present("pdfunite") {
+    if args.is_present("pdfunite-synctex") {
+        "pdfunite-synctex"
+    } else if args.is_present("pdfunite") {
         "pdfunite"
-    } else if args.is_present("unite") {
-        "unite"
+    } else if args.is_present("tex-unite") {
+        "tex-unite"
     } else {
         "preview"
     }
@@ -1295,6 +1304,85 @@ fn build_united_document(
     ))
 }
 
+fn unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn compile_united_artifacts(
+    source_content: &str,
+    frames: &[String],
+    frame_source_lines: &[(usize, usize)],
+    generated_documents: &[GeneratedDocument],
+    cache_subdir: &Path,
+    original_source_path: &Path,
+    input_dir: &Path,
+    compiler_options: &[String],
+    run_options: LatexRunOptions,
+) -> Result<UnitedCompileArtifacts> {
+    let (united_tex, mut united_sync_map) = build_united_document(
+        source_content,
+        frames,
+        frame_source_lines,
+        generated_documents,
+        cache_subdir,
+        original_source_path,
+    )?;
+
+    let united_job_name = format!("{}{}", UNITED_TEMP_PREFIX, unix_timestamp_millis());
+    united_sync_map.temp_file_name = format!("{}.tex", united_job_name);
+
+    let united_tex_file = input_dir.join(&united_sync_map.temp_file_name);
+    let united_pdf = cache_subdir.join(format!("{}.pdf", united_job_name));
+    write(&united_tex_file, united_tex).map_err(|err| {
+        error!("Failed to write united.tex: {}", err);
+        FasterBeamerError::IoError
+    })?;
+
+    let compiler = apply_compiler_options(
+        LatexCompiler::new_in(cache_subdir.to_path_buf())
+            .add_arg("-shell-escape")
+            .add_arg("-interaction=nonstopmode")
+            .with_current_dir(input_dir.to_path_buf()),
+        compiler_options,
+    );
+
+    let compile_result = compiler.run(
+        Path::new(tex_input_name(&united_tex_file)),
+        &LatexInput::new(),
+        run_options,
+    );
+
+    if let Err(err) = compile_result {
+        let error_message = format!("{}", err);
+        if let Err(_err) = write_master_log_for_united_failure(
+            original_source_path,
+            cache_subdir,
+            &united_sync_map,
+            &error_message,
+        ) {
+            warn!(
+                "Failed to write source log for united compilation failure: {}",
+                original_source_path.display()
+            );
+        }
+        error!("Failed to run united TeX compile!\n{}", error_message);
+    }
+
+    if united_pdf.is_file() {
+        Ok(UnitedCompileArtifacts {
+            tex_file: united_tex_file,
+            pdf_file: united_pdf,
+            sync_map: united_sync_map,
+        })
+    } else {
+        error!("Compilation failed!");
+        Err(FasterBeamerError::CompileError)
+    }
+}
+
 fn tex_input_name(path: &Path) -> &str {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1309,8 +1397,20 @@ fn frame_temp_file_name(hash: &md5::Digest) -> String {
     format!("{}{:x}.tex", FRAME_TEMP_PREFIX, hash)
 }
 
-fn preamble_job_name(preamble_hash: &md5::Digest, is_draft: bool) -> String {
-    format!("{}{:x}_{}", PREAMBLE_TEMP_PREFIX, preamble_hash, is_draft)
+fn append_compiler_options_cache_key(input: &mut String, compiler_options: &[String]) {
+    if compiler_options.is_empty() {
+        return;
+    }
+
+    input.push_str("\n% faster-beamer compiler options\n");
+    for option in compiler_options {
+        input.push_str(option);
+        input.push('\n');
+    }
+}
+
+fn preamble_job_name(preamble_hash: &md5::Digest) -> String {
+    format!("{}{:x}", PREAMBLE_TEMP_PREFIX, preamble_hash)
 }
 
 fn compiled_pdf_path(cache_subdir: &Path, temp_file_name: &str) -> PathBuf {
@@ -1615,7 +1715,9 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         FasterBeamerError::IoError
     })?;
 
-    let preamble_hash = md5::compute(&preamble);
+    let mut preamble_hash_input = preamble.clone();
+    append_compiler_options_cache_key(&mut preamble_hash_input, &compiler_options);
+    let preamble_hash = md5::compute(&preamble_hash_input);
     let preamble_line_count = logical_line_count(&preamble);
     let document_begin_line = find
         .map(|idx| line_number_at(&parsed_file.file_content, idx))
@@ -1625,7 +1727,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .rfind("\\end{document}")
         .map(|idx| line_number_at(&parsed_file.file_content, idx))
         .unwrap_or(document_begin_line);
-    let preamble_filename = preamble_job_name(&preamble_hash, args.is_present("draft"));
+    let preamble_filename = preamble_job_name(&preamble_hash);
     let preamble_format_path = input_dir.join(format!("{}.fmt", preamble_filename));
     if preamble_format_path.is_file()
     {
@@ -1748,6 +1850,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             hash_input.push_str(&support_file.content);
             hash_input.push('\n');
         }
+        append_compiler_options_cache_key(&mut hash_input, &compiler_options);
 
         let hash = md5::compute(&hash_input);
         let temp_file_name = frame_temp_file_name(&hash);
@@ -2032,15 +2135,26 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         return Err(FasterBeamerError::CompileError);
     }
 
-    if args.is_present("pdfunite") {
-        info!("Publish: pdfunite -> {}", Path::new(&output_file).display());
-        let output = command.arg(&output_file).output();
+    let pdfunite_with_synctex = args.is_present("pdfunite-synctex");
+    if args.is_present("pdfunite") || pdfunite_with_synctex {
+        let merged_pdf = cache_subdir.join(PDFUNITE_TEMP_FILE);
+        let publish_label = if pdfunite_with_synctex {
+            "pdfunite + synctex"
+        } else {
+            "pdfunite"
+        };
+        info!(
+            "Publish: {} -> {}",
+            publish_label,
+            Path::new(&output_file).display()
+        );
+        let output = command.arg(&merged_pdf).output();
 
         match output {
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
                     error!(
-                        "Failed to run pdfunite: pdfunite was not found on PATH. Install it or use --unite instead."
+                        "Failed to run pdfunite: pdfunite was not found on PATH. Install it or use --tex-unite instead."
                     );
                 } else {
                     error!("Failed to run pdf unite!\n{}", e);
@@ -2060,83 +2174,76 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::PdfUniteError);
             }
-            _ => {
-                clear_published_synctex(&output_file);
+            Ok(_) => {
+                if pdfunite_with_synctex {
+                    match compile_united_artifacts(
+                        &parsed_file.file_content,
+                        &frames,
+                        &frame_source_lines,
+                        &generated_documents,
+                        &cache_subdir,
+                        &original_source_path,
+                        &input_dir,
+                        &compiler_options,
+                        run_options,
+                    ) {
+                        Ok(united) => {
+                            publish_output_file(&merged_pdf, &output_file)?;
+                            rewrite_synctex_to_original(&united.pdf_file, &united.sync_map)?;
+                            publish_synctex_file(&united.pdf_file, &output_file)?;
+                            if let Err(err) = std::fs::remove_file(&united.tex_file) {
+                                warn!(
+                                    "Failed to remove temporary united source {}: {}",
+                                    united.tex_file.display(),
+                                    err
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            publish_output_artifacts(&merged_pdf, &output_file, None)?;
+                            warn!(
+                                "Published the pdfunite output without SyncTeX because the temporary united TeX build failed."
+                            );
+
+                            *PREVIOUS_FRAMES.lock().unwrap() = frames;
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    publish_output_artifacts(&merged_pdf, &output_file, None)?;
+                }
             }
         };
-    } else if args.is_present("unite") {
+    } else if args.is_present("tex-unite") {
         info!("Publish: united document -> {}", Path::new(&output_file).display());
 
-        let (united_tex, mut united_sync_map) = build_united_document(
+        match compile_united_artifacts(
             &parsed_file.file_content,
             &frames,
             &frame_source_lines,
             &generated_documents,
             &cache_subdir,
             &original_source_path,
-        )?;
-
-        let united_suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or(0);
-        let united_job_name = format!("{}{}", UNITED_TEMP_PREFIX, united_suffix);
-        united_sync_map.temp_file_name = format!("{}.tex", united_job_name);
-
-        let united_tex_file = input_dir.join(&united_sync_map.temp_file_name);
-        let united_pdf = cache_subdir.join(format!("{}.pdf", united_job_name));
-        let write_result = write(&united_tex_file, united_tex);
-        if write_result.is_ok() {
-            let compiler = apply_compiler_options(
-                LatexCompiler::new_in(cache_subdir.clone())
-                    .add_arg("-shell-escape")
-                    .add_arg("-interaction=nonstopmode")
-                    .with_current_dir(input_dir.clone()),
-                &compiler_options,
-            );
-
-            let compile_result = compiler.run(
-                Path::new(tex_input_name(&united_tex_file)),
-                &LatexInput::new(),
-                run_options,
-            );
-
-            let united_error_message = compile_result.err().map(|err| format!("{}", err));
-
-            if let Some(error_message) = united_error_message.as_ref() {
-                if let Err(_err) = write_master_log_for_united_failure(
-                    &original_source_path,
-                    &cache_subdir,
-                    &united_sync_map,
-                    error_message,
-                ) {
-                    warn!(
-                        "Failed to write source log for united compilation failure: {}",
-                        original_source_path.display()
-                    );
-                }
-                error!("Failed to run pdf unite!\n{}", error_message);
-            }
-
-            if united_pdf.is_file() {
-                publish_output_artifacts(&united_pdf, &output_file, Some(&united_sync_map))?;
-                if let Err(err) = std::fs::remove_file(&united_tex_file) {
+            &input_dir,
+            &compiler_options,
+            run_options,
+        ) {
+            Ok(united) => {
+                publish_output_artifacts(&united.pdf_file, &output_file, Some(&united.sync_map))?;
+                if let Err(err) = std::fs::remove_file(&united.tex_file) {
                     warn!(
                         "Failed to remove temporary united source {}: {}",
-                        united_tex_file.display(),
+                        united.tex_file.display(),
                         err
                     );
                 }
-            } else {
-                error!("Compilation failed!");
+            }
+            Err(err) => {
                 show_error_slide(&cachedir, &output_file);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
-                return Err(FasterBeamerError::CompileError);
+                return Err(err);
             }
-        } else {
-            error!("Failed to write united.tex: {:?}", write_result.err());
-            return Err(FasterBeamerError::PdfUniteError);
         }
     } else {
         if first_changed_frame == generated_documents.len() {
