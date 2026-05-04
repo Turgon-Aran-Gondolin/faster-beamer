@@ -40,6 +40,7 @@ pub enum FasterBeamerError {
 
 pub type Result<T> = ::std::result::Result<T, FasterBeamerError>;
 
+#[derive(Clone)]
 struct SyncTexLineSegment {
     temp_start_line: usize,
     line_count: usize,
@@ -76,6 +77,17 @@ struct GeneratedDocument {
 struct GeneratedSupportFile {
     extension: &'static str,
     content: String,
+}
+
+struct FrameCompileFailure {
+    frame_idx: usize,
+    source_start_line: usize,
+    source_line_count: usize,
+    temp_file: PathBuf,
+    temp_file_name: String,
+    sync_segments: Vec<SyncTexLineSegment>,
+    frame_preview: String,
+    error: String,
 }
 
 struct SourceSection {
@@ -157,6 +169,10 @@ lazy_static! {
 }
 
 lazy_static! {
+    static ref TEX_LOG_LINE_REGEX: Regex = Regex::new(r"\bl\.(?P<line>\d+)\b").unwrap();
+}
+
+lazy_static! {
     static ref PREVIOUS_FRAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 }
 
@@ -172,6 +188,227 @@ fn frame_counter_setup(frame_idx: usize, correct_frame_numbers: bool) -> String 
     } else {
         String::new()
     }
+}
+
+fn frame_preview(frame_text: &str) -> String {
+    const PREVIEW_LIMIT: usize = 160;
+
+    let line = frame_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+
+    if line.chars().count() <= PREVIEW_LIMIT {
+        line.to_string()
+    } else {
+        let truncated: String = line.chars().take(PREVIEW_LIMIT).collect();
+        format!("{}...", truncated)
+    }
+}
+
+fn log_frame_compile_failures(
+    failures: &[FrameCompileFailure],
+    source_file: &Path,
+    frame_count: usize,
+) {
+    error!(
+        "Compilation aborted: {} frame build(s) failed.",
+        failures.len()
+    );
+
+    for failure in failures {
+        let source_end_line = failure
+            .source_start_line
+            .saturating_add(failure.source_line_count.saturating_sub(1));
+
+        error!(
+            "Frame {}/{} ({}:{}-{} -> {}): {}",
+            failure.frame_idx + 1,
+            frame_count,
+            source_file.display(),
+            failure.source_start_line,
+            source_end_line,
+            failure.temp_file.display(),
+            failure.error
+        );
+
+        if !failure.frame_preview.is_empty() {
+            error!("Frame preview: {}", failure.frame_preview);
+        }
+    }
+}
+
+fn map_temp_line_from_segments(segments: &[SyncTexLineSegment], temp_line: usize) -> usize {
+    for segment in segments.iter().rev() {
+        if temp_line >= segment.temp_start_line
+            && temp_line < segment.temp_start_line + segment.line_count
+        {
+            return segment.source_start_line + (temp_line - segment.temp_start_line);
+        }
+    }
+
+    temp_line
+}
+
+fn remap_frame_log_to_source(failure: &FrameCompileFailure, source_file_name: &str, log_content: &str) -> String {
+    let mut remapped = log_content.replace(&failure.temp_file_name, source_file_name);
+    remapped = remapped.replace(failure.temp_file.to_string_lossy().as_ref(), source_file_name);
+
+    TEX_LOG_LINE_REGEX
+        .replace_all(&remapped, |captures: &regex::Captures<'_>| {
+            let line = captures
+                .name("line")
+                .and_then(|value| value.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mapped = map_temp_line_from_segments(&failure.sync_segments, line);
+            format!("l.{}", mapped)
+        })
+        .into_owned()
+}
+
+fn remap_log_lines_to_source(
+    log_content: &str,
+    source_file_name: &str,
+    temp_file_name: &str,
+    segments: &[SyncTexLineSegment],
+) -> String {
+    let remapped = log_content.replace(temp_file_name, source_file_name);
+
+    TEX_LOG_LINE_REGEX
+        .replace_all(&remapped, |captures: &regex::Captures<'_>| {
+            let line = captures
+                .name("line")
+                .and_then(|value| value.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mapped = map_temp_line_from_segments(segments, line);
+            format!("l.{}", mapped)
+        })
+        .into_owned()
+}
+
+fn write_master_log(source_file: &Path, content: &str) -> Result<()> {
+    let source_log = source_file.with_extension("log");
+    fs::write(&source_log, content).map_err(|err| {
+        error!("Failed to write master log {}: {}", source_log.display(), err);
+        FasterBeamerError::IoError
+    })
+}
+
+fn write_master_log_from_compile_failure(
+    source_file: &Path,
+    context: &str,
+    compiler_log_path: &Path,
+    fallback_message: &str,
+) -> Result<()> {
+    let source_file_name = tex_input_name(source_file);
+    let mut master_log = String::new();
+
+    master_log.push_str("This is faster-beamer, redirected compiler failure log.\n");
+    master_log.push_str(&format!("(./{})\n", source_file_name));
+    master_log.push_str(&format!("! faster-beamer: {} failed\n", context));
+
+    match fs::read_to_string(compiler_log_path) {
+        Ok(log_content) => {
+            master_log.push_str(&log_content);
+            if !log_content.ends_with('\n') {
+                master_log.push('\n');
+            }
+        }
+        Err(_) => {
+            master_log.push_str(fallback_message);
+            if !fallback_message.ends_with('\n') {
+                master_log.push('\n');
+            }
+        }
+    }
+
+    write_master_log(source_file, &master_log)
+}
+
+fn write_master_log_for_united_failure(
+    source_file: &Path,
+    cache_subdir: &Path,
+    sync_map: &FrameSyncTexMap,
+    fallback_message: &str,
+) -> Result<()> {
+    let source_file_name = tex_input_name(source_file);
+    let united_log_path =
+        cache_subdir.join(Path::new(&sync_map.temp_file_name).with_extension("log"));
+    let mut master_log = String::new();
+
+    master_log.push_str("This is faster-beamer, redirected compiler failure log.\n");
+    master_log.push_str(&format!("(./{})\n", source_file_name));
+    master_log.push_str("! faster-beamer: united document compilation failed\n");
+
+    match fs::read_to_string(&united_log_path) {
+        Ok(log_content) => {
+            let remapped = remap_log_lines_to_source(
+                &log_content,
+                source_file_name,
+                &sync_map.temp_file_name,
+                &sync_map.segments,
+            );
+            master_log.push_str(&remapped);
+            if !remapped.ends_with('\n') {
+                master_log.push('\n');
+            }
+        }
+        Err(_) => {
+            master_log.push_str(fallback_message);
+            if !fallback_message.ends_with('\n') {
+                master_log.push('\n');
+            }
+        }
+    }
+
+    write_master_log(source_file, &master_log)
+}
+
+fn write_master_log_for_frame_failures(
+    failures: &[FrameCompileFailure],
+    cache_subdir: &Path,
+    source_file: &Path,
+    frame_count: usize,
+) -> Result<()> {
+    let source_file_name = tex_input_name(source_file);
+    let mut master_log = String::new();
+
+    master_log.push_str("This is faster-beamer, aggregated frame failure log.\n");
+    master_log.push_str(&format!("(./{})\n", source_file_name));
+
+    for failure in failures {
+        let log_path = cache_subdir.join(Path::new(&failure.temp_file_name).with_extension("log"));
+
+        master_log.push_str(&format!(
+            "! faster-beamer: frame {}/{} failed to compile\n",
+            failure.frame_idx + 1,
+            frame_count.max(1)
+        ));
+        master_log.push_str(&format!("l.{} {}\n", failure.source_start_line, failure.frame_preview));
+
+        match fs::read_to_string(&log_path) {
+            Ok(log_content) => {
+                let remapped = remap_frame_log_to_source(failure, source_file_name, &log_content);
+                master_log.push_str(&remapped);
+                if !remapped.ends_with('\n') {
+                    master_log.push('\n');
+                }
+            }
+            Err(err) => {
+                master_log.push_str(&format!(
+                    "! faster-beamer: could not read frame log {} ({})\n",
+                    log_path.display(),
+                    err
+                ));
+                master_log.push_str(&format!("l.{}\n", failure.source_start_line));
+                master_log.push_str(&failure.error);
+                master_log.push('\n');
+            }
+        }
+    }
+
+    write_master_log(source_file, &master_log)
 }
 
 fn compile_progress_bar(total_jobs: usize) -> ProgressBar {
@@ -1408,6 +1645,23 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         let output = command.arg(tex_input_name(input_path)).current_dir(&input_dir).output();
         match output {
             Err(e) => {
+                let preamble_log_path = input_dir.join(format!("{}.log", preamble_filename));
+                let fallback = format!(
+                    "Failed to compile preamble for {}: {}",
+                    original_source_path.display(),
+                    e
+                );
+                if let Err(_err) = write_master_log_from_compile_failure(
+                    &original_source_path,
+                    "preamble compilation",
+                    &preamble_log_path,
+                    &fallback,
+                ) {
+                    warn!(
+                        "Failed to write source log for preamble failure: {}",
+                        original_source_path.display()
+                    );
+                }
                 log_command_error("pdflatex", "compile the preamble", &e);
                 show_error_slide(&cachedir, &output_file);
 
@@ -1415,6 +1669,27 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 return Err(FasterBeamerError::CompileError);
             }
             Ok(output) if !output.status.success() => {
+                let preamble_log_path = input_dir.join(format!("{}.log", preamble_filename));
+                let stderr = str::from_utf8(&output.stderr).unwrap_or("").trim();
+                let stdout = str::from_utf8(&output.stdout).unwrap_or("").trim();
+                let fallback = if !stderr.is_empty() {
+                    stderr.to_string()
+                } else if !stdout.is_empty() {
+                    stdout.to_string()
+                } else {
+                    String::from("preamble compilation failed")
+                };
+                if let Err(_err) = write_master_log_from_compile_failure(
+                    &original_source_path,
+                    "preamble compilation",
+                    &preamble_log_path,
+                    &fallback,
+                ) {
+                    warn!(
+                        "Failed to write source log for preamble failure: {}",
+                        original_source_path.display()
+                    );
+                }
                 error!(
                     "Failed to compile preamble! {}",
                     str::from_utf8(&output.stderr).unwrap()
@@ -1592,14 +1867,17 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
     let progress_bar = compile_progress_bar(compile_targets.len());
     let latex_input = LatexInput::new();
+    let compile_failures: Mutex<Vec<FrameCompileFailure>> = Mutex::new(Vec::new());
 
         let compile_document = |frame_idx: usize, document: &GeneratedDocument, needs_compile: bool| {
             let pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
+            let (source_start_line, source_line_count) = frame_source_lines[frame_idx];
+            let temp_file = input_dir.join(&document.sync_map.temp_file_name);
+            let frame_preview = frame_preview(&frames[frame_idx]);
 
             if !needs_compile {
                 trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
             } else {
-                let temp_file = input_dir.join(&document.sync_map.temp_file_name);
                 let mut support_paths = Vec::new();
 
                 if write(&temp_file, &document.tex_content).is_ok() {
@@ -1660,6 +1938,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         }
                         trace!("Compiled file {}", &temp_file.to_str().unwrap());
                     } else {
+                        let compile_error = result.err().unwrap();
                         for support_path in &support_paths {
                             if let Err(err) = std::fs::remove_file(support_path) {
                                 warn!(
@@ -1669,14 +1948,34 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                                 );
                             }
                         }
-                        error!(
-                            "Failed to compile frame {} ({})",
-                            frame_idx,
-                            &temp_file.to_str().unwrap()
-                        );
-                        error!("{}", frames[frame_idx]);
-                        error!("{}", result.err().unwrap());
+                        compile_failures
+                            .lock()
+                            .expect("compile_failures lock should not be poisoned")
+                            .push(FrameCompileFailure {
+                                frame_idx,
+                                source_start_line,
+                                source_line_count,
+                                temp_file: temp_file.clone(),
+                                temp_file_name: document.sync_map.temp_file_name.clone(),
+                                sync_segments: document.sync_map.segments.clone(),
+                                frame_preview,
+                                error: format!("{}", compile_error),
+                            });
                     };
+                } else {
+                    compile_failures
+                        .lock()
+                        .expect("compile_failures lock should not be poisoned")
+                        .push(FrameCompileFailure {
+                            frame_idx,
+                            source_start_line,
+                            source_line_count,
+                            temp_file: temp_file.clone(),
+                            temp_file_name: document.sync_map.temp_file_name.clone(),
+                            sync_segments: document.sync_map.segments.clone(),
+                            frame_preview,
+                            error: String::from("Failed to write generated frame source to disk."),
+                        });
                 }
             };
             progress_bar.inc(1);
@@ -1710,6 +2009,28 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             });
     }
     progress_bar.finish_and_clear();
+
+    let failed_compiles = compile_failures
+        .into_inner()
+        .expect("compile_failures lock should not be poisoned");
+    if !failed_compiles.is_empty() {
+        if let Err(err) = write_master_log_for_frame_failures(
+            &failed_compiles,
+            &cache_subdir,
+            &original_source_path,
+            frames.len(),
+        ) {
+            let _ = err;
+            warn!(
+                "Failed to create aggregated source log for {}.",
+                original_source_path.display()
+            );
+        }
+        log_frame_compile_failures(&failed_compiles, &original_source_path, frames.len());
+        show_error_slide(&cachedir, &output_file);
+        *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
+        return Err(FasterBeamerError::CompileError);
+    }
 
     if args.is_present("pdfunite") {
         info!("Publish: pdfunite -> {}", Path::new(&output_file).display());
@@ -1767,7 +2088,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         let write_result = write(&united_tex_file, united_tex);
         if write_result.is_ok() {
             let compiler = apply_compiler_options(
-                LatexCompiler::new_in(cache_subdir)
+                LatexCompiler::new_in(cache_subdir.clone())
                     .add_arg("-shell-escape")
                     .add_arg("-interaction=nonstopmode")
                     .with_current_dir(input_dir.clone()),
@@ -1780,11 +2101,21 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 run_options,
             );
 
-            if compile_result.is_err() {
-                error!(
-                    "Failed to run pdf unite!\n{}",
-                    compile_result.err().unwrap()
-                );
+            let united_error_message = compile_result.err().map(|err| format!("{}", err));
+
+            if let Some(error_message) = united_error_message.as_ref() {
+                if let Err(_err) = write_master_log_for_united_failure(
+                    &original_source_path,
+                    &cache_subdir,
+                    &united_sync_map,
+                    error_message,
+                ) {
+                    warn!(
+                        "Failed to write source log for united compilation failure: {}",
+                        original_source_path.display()
+                    );
+                }
+                error!("Failed to run pdf unite!\n{}", error_message);
             }
 
             if united_pdf.is_file() {
