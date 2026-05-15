@@ -117,7 +117,7 @@ enum TocFrameSupport {
 
 lazy_static! {
     static ref FRAME_REGEX: Regex =
-        Regex::new(r"(?ms)^[ \t]*\\begin\{frame\}.*?^[ \t]*\\end\{frame\}").unwrap();
+        Regex::new(r"(?ms)^[ \t]*\\begin\{frame\}.*?^[ \t]*\\end\{frame\}|^[ \t]*\\sectiontitlepage\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|^[ \t]*\\titlepage\b").unwrap();
 }
 lazy_static! {
     static ref SECTION_LINE_REGEX: Regex = Regex::new(
@@ -420,11 +420,21 @@ fn write_master_log_for_frame_failures(
 
 fn compile_progress_bar(total_jobs: usize) -> ProgressBar {
     let progress_bar = ProgressBar::new(total_jobs as u64);
-    let style = ProgressStyle::with_template("Compile {pos}/{len} jobs [{bar:40.cyan/blue}]")
-        .expect("compile progress bar template should be valid")
-        .progress_chars("##-");
+    let style = ProgressStyle::with_template("Compile {pos}/{len} jobs [{msg}]")
+        .expect("compile progress bar template should be valid");
     progress_bar.set_style(style);
+    progress_bar.set_message(".".repeat(total_jobs));
     progress_bar
+}
+
+fn render_frame_map(map: &[(char, usize)]) -> String {
+    let mut out = String::new();
+    for (status, frame_num) in map {
+        out.push_str(&format!("{}{}", frame_num, status));
+        out.push(' ');
+    }
+    out.pop(); // trailing space
+    out
 }
 
 fn show_error_slide(cachedir: &Path, output_file: &str) {
@@ -1596,6 +1606,8 @@ fn latex_run_options(latex_pass_count: usize, bibliography: Option<BibliographyT
 }
 
 pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
+    let total_start_time = std::time::Instant::now();
+    let mut step_start_time = total_start_time;
     let input_path = Path::new(&input_file);
     let (input_dir, cachedir, cache_subdir) = current_cache_paths(input_file);
     let original_source_path = input_path
@@ -1656,10 +1668,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         build_mode
     );
     info!(
-        "Frames: total={}, parser={}",
+        "Frames: total={}, parser={} ({} ms)",
         frames.len(),
-        if !frame_nodes.is_empty() { "tree-sitter" } else { "regex" }
+        if !frame_nodes.is_empty() { "tree-sitter" } else { "regex" },
+        step_start_time.elapsed().as_millis()
     );
+    step_start_time = std::time::Instant::now();
 
     if log_enabled!(Trace) && args.is_present("tree-sitter") {
         let root_node = parsed_file.syntax_tree.root_node();
@@ -1729,9 +1743,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .unwrap_or(document_begin_line);
     let preamble_filename = preamble_job_name(&preamble_hash);
     let preamble_format_path = input_dir.join(format!("{}.fmt", preamble_filename));
-    if preamble_format_path.is_file()
+    if preamble_format_path.is_file() && !force_recompile
     {
-        info!("Preamble: cached {}", preamble_format_path.display());
+        info!("Preamble: cached {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
+        step_start_time = std::time::Instant::now();
     } else {
         info!("Preamble: compiling {}", preamble_format_path.display());
         let mut command = Command::new("pdflatex");
@@ -1801,7 +1816,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
                 return Err(FasterBeamerError::CompileError);
             }
-            _ => {}
+            _ => {
+                info!("Preamble: compiled {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
+                step_start_time = std::time::Instant::now();
+            }
         };
     }
 
@@ -1928,27 +1946,29 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     );
 
     let mut seen_compile_jobs = HashSet::new();
-    let compile_targets: Vec<(usize, &GeneratedDocument, bool)> = generated_documents
-        .iter()
-        .enumerate()
-        .filter_map(|(frame_idx, document)| {
-            if !seen_compile_jobs.insert(document.sync_map.temp_file_name.clone()) {
-                return None;
-            }
+    let mut compile_targets = Vec::new();
+    let mut cached_frames = 0;
 
-            let compiled_pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
-            let dependencies = dependencies_for_document(&cache_subdir, document);
-            let needs_compile = force_recompile
-                || !compiled_output_is_fresh(&compiled_pdf, &dependencies);
-            Some((frame_idx, document, needs_compile))
-        })
-        .collect();
-    let compile_job_count = compile_targets.len();
-    let frames_to_compile = compile_targets
-        .iter()
-        .filter(|(_, _, needs_compile)| *needs_compile)
-        .count();
-    let cached_frames = compile_job_count.saturating_sub(frames_to_compile);
+    for (frame_idx, document) in generated_documents.iter().enumerate() {
+        if !seen_compile_jobs.insert(document.sync_map.temp_file_name.clone()) {
+            continue;
+        }
+
+        let compiled_pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
+        let dependencies = dependencies_for_document(&cache_subdir, document);
+        let needs_compile = force_recompile
+            || !compiled_output_is_fresh(&compiled_pdf, &dependencies);
+
+        if needs_compile {
+            compile_targets.push((frame_idx, document, needs_compile));
+        } else {
+            trace!("{} is already compiled!", compiled_pdf.to_str().unwrap_or("???"));
+            cached_frames += 1;
+        }
+    }
+
+    let compile_job_count = compile_targets.len() + cached_frames;
+    let frames_to_compile = compile_targets.len();
     let parallel_label = match parallel_job_count {
         Some(job_count) => format!("{} jobs", job_count),
         None if use_parallel => String::from("auto"),
@@ -1962,110 +1982,111 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         first_changed_frame_label(first_changed_frame, frames.len())
     );
     info!(
-        "LaTeX: passes={}, bibliography={}, parallel={}",
+        "LaTeX: passes={}, bibliography={}, parallel={} ({} ms)",
         latex_pass_count,
         bibliography_label(bibliography),
-        parallel_label
+        parallel_label,
+        step_start_time.elapsed().as_millis()
     );
+    step_start_time = std::time::Instant::now();
 
+    let frame_map: std::sync::Arc<std::sync::Mutex<Vec<(char, usize)>>> = std::sync::Arc::new(
+        std::sync::Mutex::new(
+            compile_targets.iter().map(|(fi, _, _)| ('.', fi + 1)).collect()
+        )
+    );
     let progress_bar = compile_progress_bar(compile_targets.len());
     let latex_input = LatexInput::new();
     let compile_failures: Mutex<Vec<FrameCompileFailure>> = Mutex::new(Vec::new());
 
-        let compile_document = |frame_idx: usize, document: &GeneratedDocument, needs_compile: bool| {
-            let pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
+        let compile_document = |job_idx: usize, frame_idx: usize, document: &GeneratedDocument| {
             let (source_start_line, source_line_count) = frame_source_lines[frame_idx];
             let temp_file = input_dir.join(&document.sync_map.temp_file_name);
             let frame_preview = frame_preview(&frames[frame_idx]);
 
-            if !needs_compile {
-                trace!("{} is already compiled!", pdf.to_str().unwrap_or("???"));
-            } else {
-                let mut support_paths = Vec::new();
+            {
+                let mut map = frame_map.lock().unwrap();
+                map[job_idx].0 = 'R';
+                progress_bar.set_message(render_frame_map(&map));
+            }
+            let mut support_paths = Vec::new();
 
-                if write(&temp_file, &document.tex_content).is_ok() {
-                    for support_file in &document.support_files {
-                        let support_path = cache_subdir.join(
-                            Path::new(&document.sync_map.temp_file_name)
-                                .with_extension(support_file.extension),
+            if write(&temp_file, &document.tex_content).is_ok() {
+                for support_file in &document.support_files {
+                    let support_path = cache_subdir.join(
+                        Path::new(&document.sync_map.temp_file_name)
+                            .with_extension(support_file.extension),
+                    );
+
+                    match write(&support_path, &support_file.content) {
+                        Ok(_) => support_paths.push(support_path),
+                        Err(err) => warn!(
+                            "Failed to write temporary support file {}: {}",
+                            support_path.display(),
+                            err
+                        ),
+                    }
+                }
+
+                let compiler = apply_compiler_options(
+                    LatexCompiler::new_in(cache_subdir.clone())
+                        .add_arg("-shell-escape")
+                        .add_arg("-interaction=nonstopmode")
+                        .with_current_dir(input_dir.clone()),
+                    &compiler_options,
+                );
+                let document_run_options = if document.support_files.is_empty() {
+                    run_options
+                } else {
+                    run_options
+                        .with_latex_pass_count(1)
+                        .with_bibliography_tool(None)
+                };
+
+                let result = compiler.run(
+                    Path::new(tex_input_name(&temp_file)),
+                    &latex_input,
+                    document_run_options,
+                );
+                if result.is_ok() {
+                    if update_dependency_manifest(&cache_subdir, &document.sync_map.temp_file_name).is_err() {
+                        warn!(
+                            "Failed to update dependency manifest for {}",
+                            document.sync_map.temp_file_name
                         );
-
-                        match write(&support_path, &support_file.content) {
-                            Ok(_) => support_paths.push(support_path),
-                            Err(err) => warn!(
-                                "Failed to write temporary support file {}: {}",
+                    }
+                    if let Err(err) = std::fs::remove_file(&temp_file) {
+                        warn!("Failed to remove temporary frame source {}: {}", temp_file.display(), err);
+                    }
+                    for support_path in &support_paths {
+                        if let Err(err) = std::fs::remove_file(support_path) {
+                            warn!(
+                                "Failed to remove temporary support file {}: {}",
                                 support_path.display(),
                                 err
-                            ),
-                        }
-                    }
-
-                    let compiler = apply_compiler_options(
-                        LatexCompiler::new_in(cache_subdir.clone())
-                            .add_arg("-shell-escape")
-                            .add_arg("-interaction=nonstopmode")
-                            .with_current_dir(input_dir.clone()),
-                        &compiler_options,
-                    );
-                    let document_run_options = if document.support_files.is_empty() {
-                        run_options
-                    } else {
-                        run_options
-                            .with_latex_pass_count(1)
-                            .with_bibliography_tool(None)
-                    };
-
-                    let result = compiler.run(
-                        Path::new(tex_input_name(&temp_file)),
-                        &latex_input,
-                        document_run_options,
-                    );
-                    if result.is_ok() {
-                        if update_dependency_manifest(&cache_subdir, &document.sync_map.temp_file_name).is_err() {
-                            warn!(
-                                "Failed to update dependency manifest for {}",
-                                document.sync_map.temp_file_name
                             );
                         }
-                        if let Err(err) = std::fs::remove_file(&temp_file) {
-                            warn!("Failed to remove temporary frame source {}: {}", temp_file.display(), err);
-                        }
-                        for support_path in &support_paths {
-                            if let Err(err) = std::fs::remove_file(support_path) {
-                                warn!(
-                                    "Failed to remove temporary support file {}: {}",
-                                    support_path.display(),
-                                    err
-                                );
-                            }
-                        }
-                        trace!("Compiled file {}", &temp_file.to_str().unwrap());
-                    } else {
-                        let compile_error = result.err().unwrap();
-                        for support_path in &support_paths {
-                            if let Err(err) = std::fs::remove_file(support_path) {
-                                warn!(
-                                    "Failed to remove temporary support file {}: {}",
-                                    support_path.display(),
-                                    err
-                                );
-                            }
-                        }
-                        compile_failures
-                            .lock()
-                            .expect("compile_failures lock should not be poisoned")
-                            .push(FrameCompileFailure {
-                                frame_idx,
-                                source_start_line,
-                                source_line_count,
-                                temp_file: temp_file.clone(),
-                                temp_file_name: document.sync_map.temp_file_name.clone(),
-                                sync_segments: document.sync_map.segments.clone(),
-                                frame_preview,
-                                error: format!("{}", compile_error),
-                            });
-                    };
+                    }
+                    trace!("Compiled file {}", &temp_file.to_str().unwrap());
+                    let mut map = frame_map.lock().unwrap();
+                    map[job_idx].0 = '#';
+                    progress_bar.set_message(render_frame_map(&map));
                 } else {
+                    let compile_error = result.err().unwrap();
+                    {
+                        let mut map = frame_map.lock().unwrap();
+                        map[job_idx].0 = 'X';
+                        progress_bar.set_message(render_frame_map(&map));
+                    }
+                    for support_path in &support_paths {
+                        if let Err(err) = std::fs::remove_file(support_path) {
+                            warn!(
+                                "Failed to remove temporary support file {}: {}",
+                                support_path.display(),
+                                err
+                            );
+                        }
+                    }
                     compile_failures
                         .lock()
                         .expect("compile_failures lock should not be poisoned")
@@ -2077,10 +2098,29 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                             temp_file_name: document.sync_map.temp_file_name.clone(),
                             sync_segments: document.sync_map.segments.clone(),
                             frame_preview,
-                            error: String::from("Failed to write generated frame source to disk."),
+                            error: format!("{}", compile_error),
                         });
+                };
+            } else {
+                {
+                    let mut map = frame_map.lock().unwrap();
+                    map[job_idx].0 = 'X';
+                    progress_bar.set_message(render_frame_map(&map));
                 }
-            };
+                compile_failures
+                    .lock()
+                    .expect("compile_failures lock should not be poisoned")
+                    .push(FrameCompileFailure {
+                        frame_idx,
+                        source_start_line,
+                        source_line_count,
+                        temp_file: temp_file.clone(),
+                        temp_file_name: document.sync_map.temp_file_name.clone(),
+                        sync_segments: document.sync_map.segments.clone(),
+                        frame_preview,
+                        error: String::from("Failed to write generated frame source to disk."),
+                    });
+            }
             progress_bar.inc(1);
         };
 
@@ -2093,25 +2133,30 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 .install(|| {
                     compile_targets
                         .par_iter()
-                        .for_each(|(frame_idx, document, needs_compile)| {
-                            compile_document(*frame_idx, document, *needs_compile)
+                        .enumerate()
+                        .for_each(|(job_idx, (frame_idx, document, _))| {
+                            compile_document(job_idx, *frame_idx, document)
                         });
                 });
         } else {
             compile_targets
                 .par_iter()
-                .for_each(|(frame_idx, document, needs_compile)| {
-                    compile_document(*frame_idx, document, *needs_compile)
+                .enumerate()
+                .for_each(|(job_idx, (frame_idx, document, _))| {
+                    compile_document(job_idx, *frame_idx, document)
                 });
         }
     } else {
         compile_targets
             .iter()
-            .for_each(|(frame_idx, document, needs_compile)| {
-                compile_document(*frame_idx, document, *needs_compile)
+            .enumerate()
+            .for_each(|(job_idx, (frame_idx, document, _))| {
+                compile_document(job_idx, *frame_idx, document)
             });
     }
     progress_bar.finish_and_clear();
+    info!("Frames compiled ({} ms)", step_start_time.elapsed().as_millis());
+    step_start_time = std::time::Instant::now();
 
     let failed_compiles = compile_failures
         .into_inner()
@@ -2144,10 +2189,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             "pdfunite"
         };
         info!(
-            "Publish: {} -> {}",
+            "Publish: {} -> {} ({} ms)",
             publish_label,
-            Path::new(&output_file).display()
+            Path::new(&output_file).display(),
+            step_start_time.elapsed().as_millis()
         );
+        step_start_time = std::time::Instant::now();
         let output = command.arg(&merged_pdf).output();
 
         match output {
@@ -2215,7 +2262,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             }
         };
     } else if args.is_present("tex-unite") {
-        info!("Publish: united document -> {}", Path::new(&output_file).display());
+        info!("Publish: united document -> {} ({} ms)", Path::new(&output_file).display(), step_start_time.elapsed().as_millis());
+        step_start_time = std::time::Instant::now();
 
         match compile_united_artifacts(
             &parsed_file.file_content,
@@ -2251,11 +2299,13 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         }
         if first_changed_frame < generated_documents.len() {
             info!(
-                "Publish: preview frame {}/{} -> {}",
+                "Publish: preview frame {}/{} -> {} ({} ms)",
                 first_changed_frame + 1,
                 generated_documents.len(),
-                Path::new(&output_file).display()
+                Path::new(&output_file).display(),
+                step_start_time.elapsed().as_millis()
             );
+            step_start_time = std::time::Instant::now();
             let document = &generated_documents[first_changed_frame];
             let compiled_pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
 
@@ -2272,6 +2322,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     }
 
     *PREVIOUS_FRAMES.lock().unwrap() = frames;
+    info!("Total time: {} ms (last step {} ms)", total_start_time.elapsed().as_millis(), step_start_time.elapsed().as_millis());
     Ok(())
 }
 

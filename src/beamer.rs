@@ -30,10 +30,3 @@ pub fn get_frames(parsed_file: &ParsedFile) -> Vec<Node<'_>> {
 fn has_begin_frame(node: Node, parsed_file: &ParsedFile) -> bool {
     node.kind() == "begin" && parsed_file.get_node_string(&node).contains("{frame}")
 }
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn it_works() {}
-}
