@@ -186,6 +186,7 @@ const FRAME_TEMP_PREFIX: &str = "faster-beamer-temp-";
 const PREAMBLE_TEMP_PREFIX: &str = "faster-beamer-preamble-";
 const UNITED_TEMP_PREFIX: &str = "faster-beamer-united-";
 const PDFUNITE_TEMP_FILE: &str = "faster-beamer-pdfunite-output.pdf";
+const LUALATEX_AUTO_PARALLEL_JOBS: usize = 3;
 const GRAPHICS_EXTENSIONS: [&str; 6] = ["pdf", "png", "jpg", "jpeg", "eps", "svg"];
 const DEPENDENCY_MANIFEST_EXTENSION: &str = "deps";
 
@@ -1623,6 +1624,20 @@ fn parallel_job_count(args: &ArgMatches) -> Option<usize> {
         .and_then(|count| count.parse::<usize>().ok())
 }
 
+fn effective_parallel_job_count(
+    latex_engine: LatexEngine,
+    parallel_requested: bool,
+    explicit_job_count: Option<usize>,
+) -> Option<usize> {
+    explicit_job_count.or_else(|| {
+        if parallel_requested && latex_engine == LatexEngine::LuaLatex {
+            Some(LUALATEX_AUTO_PARALLEL_JOBS)
+        } else {
+            None
+        }
+    })
+}
+
 fn apply_compiler_options(mut compiler: LatexCompiler, compiler_options: &[String]) -> LatexCompiler {
     for option in compiler_options {
         compiler = compiler.add_arg(option);
@@ -1670,13 +1685,28 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let compiler_options = compiler_options(args);
     let selected_engine = latex_engine(args);
     let precompile_preamble = precompile_preamble(args, selected_engine);
-    let parallel_job_count = parallel_job_count(args);
+    let explicit_parallel_job_count = parallel_job_count(args);
+    let parallel_requested = args.is_present("parallel");
+    let lualatex_auto_parallel_capped = parallel_requested
+        && explicit_parallel_job_count.is_none()
+        && selected_engine == LatexEngine::LuaLatex;
+    let parallel_job_count = effective_parallel_job_count(
+        selected_engine,
+        parallel_requested,
+        explicit_parallel_job_count,
+    );
     let use_parallel = args.is_present("parallel") || parallel_job_count.is_some();
     let build_mode = build_mode_label(args);
 
     if !input_path.is_file() {
         error!("Could not open {}", input_file);
         return Err(FasterBeamerError::InputFileNotExistent);
+    }
+    if lualatex_auto_parallel_capped {
+        warn!(
+            "Parallel: lualatex auto parallelism is capped at {} jobs; pass --jobs COUNT to override.",
+            LUALATEX_AUTO_PARALLEL_JOBS
+        );
     }
 
     let parsed_file = parsing::ParsedFile::new(input_file.to_string());
@@ -2699,5 +2729,21 @@ mod tests {
             &format_path,
             &log_path,
         ));
+    }
+
+    #[test]
+    fn lualatex_parallel_auto_is_capped() {
+        assert_eq!(
+            super::effective_parallel_job_count(super::LatexEngine::LuaLatex, true, None),
+            Some(super::LUALATEX_AUTO_PARALLEL_JOBS)
+        );
+    }
+
+    #[test]
+    fn explicit_parallel_job_count_overrides_lualatex_cap() {
+        assert_eq!(
+            super::effective_parallel_job_count(super::LatexEngine::LuaLatex, true, Some(8)),
+            Some(8)
+        );
     }
 }

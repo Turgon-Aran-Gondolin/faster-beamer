@@ -21,3 +21,6 @@
 - Investigated follow-up LuaLaTeX frame-compilation failures reporting `Invalid argument` while opening TeX Live package/font files.
 - Added a serial retry fallback for frame jobs that fail during parallel compilation and verified the patched local binary on `Changsha.tex` with explicit `lualatex --precompile-preamble -r -m=3`.
 - Confirmed the reported `Invalid argument` abort output came from a binary without the serial retry fallback, then prepared the retry patch for commit, push, and local installation.
+- Resumed after the installed retry build produced many LuaLaTeX frame failures during a full parallel verification run and began inspecting whether the retry path or logging needed further adjustment.
+- Identified that `-p` without `--jobs` uses unbounded auto parallelism while `-m=3` is multi-pass, then capped LuaLaTeX auto parallelism at three jobs unless `--jobs` is explicitly supplied.
+- Verified the capped LuaLaTeX auto-parallel build on `Changsha.tex` with `-p --precompile-preamble -r`, producing the expected PDF without frame failures.

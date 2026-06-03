@@ -148,7 +148,7 @@ fn main() {
             Arg::with_name("parallel")
                 .short("p")
                 .long("parallel")
-                .help("Compile independent frame PDFs in parallel"),
+                .help("Compile independent frame PDFs in parallel; lualatex auto parallelism is capped unless --jobs is set"),
         )
         .arg(
             Arg::with_name("jobs")
