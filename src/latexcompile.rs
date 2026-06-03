@@ -73,6 +73,36 @@ impl BibliographyTool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatexEngine {
+    PdfLatex,
+    XeLatex,
+    LuaLatex,
+}
+
+impl LatexEngine {
+    pub fn command_name(self) -> &'static str {
+        match self {
+            Self::PdfLatex => "pdflatex",
+            Self::XeLatex => "xelatex",
+            Self::LuaLatex => "lualatex",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "pdflatex" => Some(Self::PdfLatex),
+            "xelatex" => Some(Self::XeLatex),
+            "lualatex" => Some(Self::LuaLatex),
+            _ => None,
+        }
+    }
+
+    pub fn precompiles_preamble_by_default(self) -> bool {
+        matches!(self, Self::PdfLatex | Self::LuaLatex)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct LatexRunOptions {
     latex_pass_count: usize,
@@ -277,8 +307,12 @@ impl LatexCompiler {
     }
 
     pub fn new_in(working_dir: PathBuf) -> LatexCompiler {
+        Self::new_in_with_engine(working_dir, LatexEngine::PdfLatex)
+    }
+
+    pub fn new_in_with_engine(working_dir: PathBuf, engine: LatexEngine) -> LatexCompiler {
         let cmd = (
-            "pdflatex".into(),
+            engine.command_name().into(),
             vec![
                 "-interaction=nonstopmode".into(),
                 "-synctex=5".into(),

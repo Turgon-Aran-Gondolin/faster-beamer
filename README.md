@@ -59,7 +59,22 @@ faster-beamer presentation.tex --watch --bibliography bibtex
 faster-beamer presentation.tex --watch -b biber
 ```
 
-When bibliography processing is enabled, `faster-beamer` runs `pdflatex`, then the chosen bibliography backend, then `pdflatex` twice by default or `COUNT` times when `--multi-pass` is set.
+When bibliography processing is enabled, `faster-beamer` runs the selected LaTeX engine, then the chosen bibliography backend, then the selected engine twice by default or `COUNT` times when `--multi-pass` is set.
+
+By default `faster-beamer` uses `pdflatex`. To use XeLaTeX or LuaLaTeX, choose the engine explicitly:
+
+```bash
+faster-beamer presentation.tex --engine=xelatex
+faster-beamer presentation.tex --engine=lualatex
+```
+
+Preamble precompilation with `mylatexformat` is enabled by default for `pdflatex` and `lualatex`, but disabled by default for `xelatex`. XeTeX cannot dump formats for preambles that load native fonts or font mappings, which commonly makes `xelatex --precompile-preamble` fail. You can override the default either way:
+
+```bash
+faster-beamer presentation.tex --engine=xelatex --precompile-preamble
+faster-beamer presentation.tex --engine=pdflatex --no-precompile-preamble
+faster-beamer presentation.tex --engine=lualatex --no-precompile-preamble
+```
 
 If you suspect the cache contains stale or wrong frame PDFs, force a full rebuild of cached frames with `--force-recompile` or `-r`:
 
@@ -95,7 +110,7 @@ faster-beamer presentation.tex --watch --output preview.pdf
 faster-beamer presentation.tex --watch -o preview.pdf
 ```
 
-If you need to pass additional `pdflatex` flags through for frame and united builds, use repeated `--compiler-option` values:
+If you need to pass additional LaTeX-engine flags through for preamble, frame, and united builds, use repeated `--compiler-option` values:
 
 ```bash
 faster-beamer presentation.tex --compiler-option=-file-line-error
@@ -105,7 +120,7 @@ faster-beamer presentation.tex --compiler-option=-draftmode --compiler-option=-f
 ## Requirements
 
 - A Rust toolchain >= 3.39
-- A working `pdflatex` on `PATH`
+- A working selected LaTeX engine on `PATH`: `pdflatex`, `xelatex`, or `lualatex`
 - `pdfunite` on `PATH` only if you want to use `--pdfunite` or `--pdfunite-synctex`
 - `bibtex` or `biber` on `PATH` when using `--bibliography`
 

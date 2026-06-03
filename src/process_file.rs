@@ -5,7 +5,7 @@
 //
 use crate::beamer::get_frames;
 use crate::fs_utils::{cache_path, publish_file};
-use crate::latexcompile::BibliographyTool;
+use crate::latexcompile::{BibliographyTool, LatexEngine};
 use crate::parsing;
 
 use flate2::read::GzDecoder;
@@ -437,13 +437,13 @@ fn render_frame_map(map: &[(char, usize)]) -> String {
     out
 }
 
-fn show_error_slide(cachedir: &Path, output_file: &str) {
+fn show_error_slide(cachedir: &Path, output_file: &str, latex_engine: LatexEngine) {
     let error_frame = String::from_utf8_lossy(include_bytes!("error.tex")).to_owned();
     let error_file = cachedir.join("error.tex");
     let error_pdf = cachedir.join("error.pdf");
 
     if !error_pdf.exists() && write(&error_file, &error_frame[..]).is_ok() {
-        let compiler = LatexCompiler::new_in(cachedir.to_owned())
+        let compiler = LatexCompiler::new_in_with_engine(cachedir.to_owned(), latex_engine)
             .add_arg("-shell-escape")
             .add_arg("-interaction=nonstopmode");
 
@@ -1329,6 +1329,7 @@ fn compile_united_artifacts(
     cache_subdir: &Path,
     original_source_path: &Path,
     input_dir: &Path,
+    latex_engine: LatexEngine,
     compiler_options: &[String],
     run_options: LatexRunOptions,
 ) -> Result<UnitedCompileArtifacts> {
@@ -1352,7 +1353,7 @@ fn compile_united_artifacts(
     })?;
 
     let compiler = apply_compiler_options(
-        LatexCompiler::new_in(cache_subdir.to_path_buf())
+        LatexCompiler::new_in_with_engine(cache_subdir.to_path_buf(), latex_engine)
             .add_arg("-shell-escape")
             .add_arg("-interaction=nonstopmode")
             .with_current_dir(input_dir.to_path_buf()),
@@ -1407,12 +1408,26 @@ fn frame_temp_file_name(hash: &md5::Digest) -> String {
     format!("{}{:x}.tex", FRAME_TEMP_PREFIX, hash)
 }
 
-fn append_compiler_options_cache_key(input: &mut String, compiler_options: &[String]) {
+fn append_latex_cache_key(
+    input: &mut String,
+    latex_engine: LatexEngine,
+    precompile_preamble: bool,
+    compiler_options: &[String],
+) {
+    input.push_str("\n% faster-beamer latex engine\n");
+    input.push_str(latex_engine.command_name());
+    input.push('\n');
+    input.push_str(if precompile_preamble {
+        "% faster-beamer precompile preamble: true\n"
+    } else {
+        "% faster-beamer precompile preamble: false\n"
+    });
+
     if compiler_options.is_empty() {
         return;
     }
 
-    input.push_str("\n% faster-beamer compiler options\n");
+    input.push_str("% faster-beamer compiler options\n");
     for option in compiler_options {
         input.push_str(option);
         input.push('\n');
@@ -1570,6 +1585,22 @@ fn compiler_options(args: &ArgMatches) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn latex_engine(args: &ArgMatches) -> LatexEngine {
+    args.value_of("engine")
+        .and_then(LatexEngine::from_name)
+        .unwrap_or(LatexEngine::PdfLatex)
+}
+
+fn precompile_preamble(args: &ArgMatches, latex_engine: LatexEngine) -> bool {
+    if args.is_present("precompile-preamble") {
+        true
+    } else if args.is_present("no-precompile-preamble") {
+        false
+    } else {
+        latex_engine.precompiles_preamble_by_default()
+    }
+}
+
 fn parallel_job_count(args: &ArgMatches) -> Option<usize> {
     args.value_of("jobs")
         .and_then(|count| count.parse::<usize>().ok())
@@ -1620,6 +1651,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let run_options = latex_run_options(latex_pass_count, bibliography);
     let force_recompile = args.is_present("force-recompile");
     let compiler_options = compiler_options(args);
+    let selected_engine = latex_engine(args);
+    let precompile_preamble = precompile_preamble(args, selected_engine);
     let parallel_job_count = parallel_job_count(args);
     let use_parallel = args.is_present("parallel") || parallel_job_count.is_some();
     let build_mode = build_mode_label(args);
@@ -1730,7 +1763,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     })?;
 
     let mut preamble_hash_input = preamble.clone();
-    append_compiler_options_cache_key(&mut preamble_hash_input, &compiler_options);
+    append_latex_cache_key(
+        &mut preamble_hash_input,
+        selected_engine,
+        precompile_preamble,
+        &compiler_options,
+    );
     let preamble_hash = md5::compute(&preamble_hash_input);
     let preamble_line_count = logical_line_count(&preamble);
     let document_begin_line = find
@@ -1743,18 +1781,30 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .unwrap_or(document_begin_line);
     let preamble_filename = preamble_job_name(&preamble_hash);
     let preamble_format_path = input_dir.join(format!("{}.fmt", preamble_filename));
-    if preamble_format_path.is_file() && !force_recompile
+    if !precompile_preamble {
+        info!(
+            "Preamble: precompilation disabled for {} ({} ms)",
+            selected_engine.command_name(),
+            step_start_time.elapsed().as_millis()
+        );
+        step_start_time = std::time::Instant::now();
+    } else if preamble_format_path.is_file() && !force_recompile
     {
         info!("Preamble: cached {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
         step_start_time = std::time::Instant::now();
     } else {
         info!("Preamble: compiling {}", preamble_format_path.display());
-        let mut command = Command::new("pdflatex");
+        if selected_engine == LatexEngine::XeLatex {
+            warn!(
+                "Preamble precompilation with xelatex is expected to fail for preambles that load native fonts or font mappings; use --no-precompile-preamble if the format build fails."
+            );
+        }
+        let mut command = Command::new(selected_engine.command_name());
         command
             .arg("-shell-escape")
             .arg("-ini")
             .arg(format!("-jobname={}", preamble_filename))
-            .arg("&pdflatex")
+            .arg(format!("&{}", selected_engine.command_name()))
             .arg("mylatexformat.ltx");
         for option in &compiler_options {
             command.arg(option);
@@ -1779,8 +1829,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         original_source_path.display()
                     );
                 }
-                log_command_error("pdflatex", "compile the preamble", &e);
-                show_error_slide(&cachedir, &output_file);
+                log_command_error(selected_engine.command_name(), "compile the preamble", &e);
+                show_error_slide(&cachedir, &output_file, selected_engine);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
                 return Err(FasterBeamerError::CompileError);
@@ -1811,7 +1861,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     "Failed to compile preamble! {}",
                     str::from_utf8(&output.stderr).unwrap()
                 );
-                show_error_slide(&cachedir, &output_file);
+                show_error_slide(&cachedir, &output_file, selected_engine);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
                 return Err(FasterBeamerError::CompileError);
@@ -1832,7 +1882,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .zip(frame_source_lines.iter())
         .enumerate()
     {
-        let format_line = format!("%&{}\n", preamble_filename);
+        let format_line = if precompile_preamble {
+            format!("%&{}\n", preamble_filename)
+        } else {
+            String::new()
+        };
         let counter_setup = frame_counter_setup(frame_idx, correct_frame_numbers);
         let toc_frame_patch = toc_frame_patch(
             f,
@@ -1868,7 +1922,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             hash_input.push_str(&support_file.content);
             hash_input.push('\n');
         }
-        append_compiler_options_cache_key(&mut hash_input, &compiler_options);
+        append_latex_cache_key(
+            &mut hash_input,
+            selected_engine,
+            precompile_preamble,
+            &compiler_options,
+        );
 
         let hash = md5::compute(&hash_input);
         let temp_file_name = frame_temp_file_name(&hash);
@@ -1921,9 +1980,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
     if unsupported_dynamic_toc_frames > 0 {
         warn!(
-            "Detected {} dynamic Beamer TOC frame(s) that faster-beamer cannot render correctly as cached per-frame PDFs (for example \\AtBeginSection with \\tableofcontents[currentsection]). The build will continue, but the proper workflow is a full document compile such as: pdflatex -interaction=nonstopmode -halt-on-error {} ; pdflatex -interaction=nonstopmode -halt-on-error {} (and run bibtex/biber between passes if needed).",
+            "Detected {} dynamic Beamer TOC frame(s) that faster-beamer cannot render correctly as cached per-frame PDFs (for example \\AtBeginSection with \\tableofcontents[currentsection]). The build will continue, but the proper workflow is a full document compile such as: {} -interaction=nonstopmode -halt-on-error {} ; {} -interaction=nonstopmode -halt-on-error {} (and run bibtex/biber between passes if needed).",
             unsupported_dynamic_toc_frames,
+            selected_engine.command_name(),
             tex_input_name(input_path),
+            selected_engine.command_name(),
             tex_input_name(input_path),
         );
     }
@@ -1982,9 +2043,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         first_changed_frame_label(first_changed_frame, frames.len())
     );
     info!(
-        "LaTeX: passes={}, bibliography={}, parallel={} ({} ms)",
+        "LaTeX: engine={}, passes={}, bibliography={}, precompile-preamble={}, parallel={} ({} ms)",
+        selected_engine.command_name(),
         latex_pass_count,
         bibliography_label(bibliography),
+        if precompile_preamble { "on" } else { "off" },
         parallel_label,
         step_start_time.elapsed().as_millis()
     );
@@ -2029,7 +2092,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 }
 
                 let compiler = apply_compiler_options(
-                    LatexCompiler::new_in(cache_subdir.clone())
+                    LatexCompiler::new_in_with_engine(cache_subdir.clone(), selected_engine)
                         .add_arg("-shell-escape")
                         .add_arg("-interaction=nonstopmode")
                         .with_current_dir(input_dir.clone()),
@@ -2175,7 +2238,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             );
         }
         log_frame_compile_failures(&failed_compiles, &original_source_path, frames.len());
-        show_error_slide(&cachedir, &output_file);
+        show_error_slide(&cachedir, &output_file, selected_engine);
         *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
         return Err(FasterBeamerError::CompileError);
     }
@@ -2206,7 +2269,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 } else {
                     error!("Failed to run pdf unite!\n{}", e);
                 }
-                show_error_slide(&cachedir, &output_file);
+                show_error_slide(&cachedir, &output_file, selected_engine);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::PdfUniteError);
@@ -2216,7 +2279,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     "Failed to run pdfunite! {}",
                     str::from_utf8(&output.stderr).unwrap()
                 );
-                show_error_slide(&cachedir, &output_file);
+                show_error_slide(&cachedir, &output_file, selected_engine);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::PdfUniteError);
@@ -2231,6 +2294,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         &cache_subdir,
                         &original_source_path,
                         &input_dir,
+                        selected_engine,
                         &compiler_options,
                         run_options,
                     ) {
@@ -2273,6 +2337,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             &cache_subdir,
             &original_source_path,
             &input_dir,
+            selected_engine,
             &compiler_options,
             run_options,
         ) {
@@ -2287,7 +2352,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 }
             }
             Err(err) => {
-                show_error_slide(&cachedir, &output_file);
+                show_error_slide(&cachedir, &output_file, selected_engine);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(err);
@@ -2313,7 +2378,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 publish_output_artifacts(&compiled_pdf, &output_file, Some(&document.sync_map))?;
             } else {
                 error!("Compilation failed!");
-                show_error_slide(&cachedir, &output_file);
+                show_error_slide(&cachedir, &output_file, selected_engine);
 
                 *PREVIOUS_FRAMES.lock().unwrap() = frames;
                 return Err(FasterBeamerError::CompileError);

@@ -17,7 +17,7 @@ use std::path::Path;
 use std::{thread, time};
 use process_file::FasterBeamerError;
 
-const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
+const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex --engine=xelatex\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
 
 fn watch_label(input_file: &str) -> String {
     format!("Watch: monitoring {}", input_file)
@@ -106,7 +106,7 @@ fn main() {
                     Ok(count) if count > 0 => Ok(()),
                     _ => Err(String::from("COUNT must be a positive integer")),
                 })
-                .help("Run pdflatex COUNT times total; using the flag without COUNT defaults to 2 passes"),
+                .help("Run the selected LaTeX engine COUNT times total; using the flag without COUNT defaults to 2 passes"),
         )
         .arg(
             Arg::with_name("bibliography")
@@ -115,7 +115,28 @@ fn main() {
                 .takes_value(true)
                 .possible_values(&["bibtex", "biber"])
                 .value_name("BACKEND")
-                .help("Run bibliography processing as pdflatex, BACKEND, then pdflatex twice by default or COUNT times if --multi-pass is set"),
+                .help("Run bibliography processing as LaTeX, BACKEND, then LaTeX twice by default or COUNT times if --multi-pass is set"),
+        )
+        .arg(
+            Arg::with_name("engine")
+                .long("engine")
+                .takes_value(true)
+                .possible_values(&["pdflatex", "xelatex", "lualatex"])
+                .default_value("pdflatex")
+                .value_name("ENGINE")
+                .help("Use ENGINE for preamble, frame, and united builds"),
+        )
+        .arg(
+            Arg::with_name("precompile-preamble")
+                .long("precompile-preamble")
+                .conflicts_with("no-precompile-preamble")
+                .help("Precompile the preamble with mylatexformat before frame builds; default for pdflatex and lualatex"),
+        )
+        .arg(
+            Arg::with_name("no-precompile-preamble")
+                .long("no-precompile-preamble")
+                .conflicts_with("precompile-preamble")
+                .help("Compile each frame with the full preamble instead of a precompiled format"),
         )
         .arg(
             Arg::with_name("force-recompile")
@@ -150,7 +171,7 @@ fn main() {
                 .multiple(true)
                 .allow_hyphen_values(true)
                 .value_name("OPTION")
-                .help("Pass OPTION through to pdflatex for preamble, frame, and united builds; may be supplied multiple times"),
+                .help("Pass OPTION through to the selected LaTeX engine for preamble, frame, and united builds; may be supplied multiple times"),
         )
         .arg(
             Arg::with_name("output")
