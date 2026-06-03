@@ -2093,16 +2093,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let latex_input = LatexInput::new();
     let compile_failures: Mutex<Vec<FrameCompileFailure>> = Mutex::new(Vec::new());
 
-        let compile_document = |job_idx: usize, frame_idx: usize, document: &GeneratedDocument| {
+    let run_document =
+        |frame_idx: usize, document: &GeneratedDocument| -> Option<FrameCompileFailure> {
             let (source_start_line, source_line_count) = frame_source_lines[frame_idx];
             let temp_file = input_dir.join(&document.sync_map.temp_file_name);
             let frame_preview = frame_preview(&frames[frame_idx]);
-
-            {
-                let mut map = frame_map.lock().unwrap();
-                map[job_idx].0 = 'R';
-                progress_bar.set_message(render_frame_map(&map));
-            }
             let mut support_paths = Vec::new();
 
             if write(&temp_file, &document.tex_content).is_ok() {
@@ -2162,16 +2157,9 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         }
                     }
                     trace!("Compiled file {}", &temp_file.to_str().unwrap());
-                    let mut map = frame_map.lock().unwrap();
-                    map[job_idx].0 = '#';
-                    progress_bar.set_message(render_frame_map(&map));
+                    None
                 } else {
                     let compile_error = result.err().unwrap();
-                    {
-                        let mut map = frame_map.lock().unwrap();
-                        map[job_idx].0 = 'X';
-                        progress_bar.set_message(render_frame_map(&map));
-                    }
                     for support_path in &support_paths {
                         if let Err(err) = std::fs::remove_file(support_path) {
                             warn!(
@@ -2181,30 +2169,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                             );
                         }
                     }
-                    compile_failures
-                        .lock()
-                        .expect("compile_failures lock should not be poisoned")
-                        .push(FrameCompileFailure {
-                            frame_idx,
-                            source_start_line,
-                            source_line_count,
-                            temp_file: temp_file.clone(),
-                            temp_file_name: document.sync_map.temp_file_name.clone(),
-                            sync_segments: document.sync_map.segments.clone(),
-                            frame_preview,
-                            error: format!("{}", compile_error),
-                        });
-                };
-            } else {
-                {
-                    let mut map = frame_map.lock().unwrap();
-                    map[job_idx].0 = 'X';
-                    progress_bar.set_message(render_frame_map(&map));
-                }
-                compile_failures
-                    .lock()
-                    .expect("compile_failures lock should not be poisoned")
-                    .push(FrameCompileFailure {
+                    Some(FrameCompileFailure {
                         frame_idx,
                         source_start_line,
                         source_line_count,
@@ -2212,11 +2177,49 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         temp_file_name: document.sync_map.temp_file_name.clone(),
                         sync_segments: document.sync_map.segments.clone(),
                         frame_preview,
-                        error: String::from("Failed to write generated frame source to disk."),
-                    });
+                        error: format!("{}", compile_error),
+                    })
+                }
+            } else {
+                Some(FrameCompileFailure {
+                    frame_idx,
+                    source_start_line,
+                    source_line_count,
+                    temp_file: temp_file.clone(),
+                    temp_file_name: document.sync_map.temp_file_name.clone(),
+                    sync_segments: document.sync_map.segments.clone(),
+                    frame_preview,
+                    error: String::from("Failed to write generated frame source to disk."),
+                })
             }
-            progress_bar.inc(1);
         };
+
+    let set_compile_job_state = |frame_map: &std::sync::Arc<std::sync::Mutex<Vec<(char, usize)>>>,
+                                 progress_bar: &ProgressBar,
+                                 job_idx: usize,
+                                 state: char| {
+        let mut map = frame_map.lock().unwrap();
+        map[job_idx].0 = state;
+        progress_bar.set_message(render_frame_map(&map));
+    };
+
+    let compile_document = |job_idx: usize, frame_idx: usize, document: &GeneratedDocument| {
+        set_compile_job_state(&frame_map, &progress_bar, job_idx, 'R');
+        let failure = run_document(frame_idx, document);
+        set_compile_job_state(
+            &frame_map,
+            &progress_bar,
+            job_idx,
+            if failure.is_some() { 'X' } else { '#' },
+        );
+        if let Some(failure) = failure {
+            compile_failures
+                .lock()
+                .expect("compile_failures lock should not be poisoned")
+                .push(failure);
+        }
+        progress_bar.inc(1);
+    };
 
     if use_parallel {
         if let Some(job_count) = parallel_job_count {
@@ -2252,9 +2255,59 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     info!("Frames compiled ({} ms)", step_start_time.elapsed().as_millis());
     step_start_time = std::time::Instant::now();
 
-    let failed_compiles = compile_failures
+    let mut failed_compiles = compile_failures
         .into_inner()
         .expect("compile_failures lock should not be poisoned");
+    if !failed_compiles.is_empty() && use_parallel {
+        let retry_frame_indices: Vec<usize> = failed_compiles
+            .iter()
+            .map(|failure| failure.frame_idx)
+            .collect();
+        warn!(
+            "{} frame build(s) failed during parallel compilation; retrying them serially.",
+            retry_frame_indices.len()
+        );
+
+        let retry_frame_map: std::sync::Arc<std::sync::Mutex<Vec<(char, usize)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                retry_frame_indices
+                    .iter()
+                    .map(|frame_idx| ('.', frame_idx + 1))
+                    .collect(),
+            ));
+        let retry_progress_bar = compile_progress_bar(retry_frame_indices.len());
+        let mut retry_failures = Vec::new();
+        for (job_idx, frame_idx) in retry_frame_indices.iter().enumerate() {
+            set_compile_job_state(&retry_frame_map, &retry_progress_bar, job_idx, 'R');
+            let failure = run_document(*frame_idx, &generated_documents[*frame_idx]);
+            set_compile_job_state(
+                &retry_frame_map,
+                &retry_progress_bar,
+                job_idx,
+                if failure.is_some() { 'X' } else { '#' },
+            );
+            if let Some(failure) = failure {
+                retry_failures.push(failure);
+            }
+            retry_progress_bar.inc(1);
+        }
+        retry_progress_bar.finish_and_clear();
+
+        if retry_failures.is_empty() {
+            info!(
+                "Serial retry recovered {} frame build(s).",
+                retry_frame_indices.len()
+            );
+            failed_compiles.clear();
+        } else {
+            warn!(
+                "Serial retry still failed for {} of {} frame build(s).",
+                retry_failures.len(),
+                retry_frame_indices.len()
+            );
+            failed_compiles = retry_failures;
+        }
+    }
     if !failed_compiles.is_empty() {
         if let Err(err) = write_master_log_for_frame_failures(
             &failed_compiles,

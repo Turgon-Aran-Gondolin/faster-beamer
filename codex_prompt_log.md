@@ -18,3 +18,6 @@
 - Ran an explicit `lualatex` check with `--precompile-preamble` and `-r` requested, targeting the real `Changsha.tex` deck.
 - Confirmed the explicit `lualatex --precompile-preamble -r` run completed successfully and produced `C:\tmp\fb-changsha-lualatex-explicit-precompile-r.pdf`.
 - Prepared the verified LuaLaTeX preamble-precompilation fix for git commit and push.
+- Investigated follow-up LuaLaTeX frame-compilation failures reporting `Invalid argument` while opening TeX Live package/font files.
+- Added a serial retry fallback for frame jobs that fail during parallel compilation and verified the patched local binary on `Changsha.tex` with explicit `lualatex --precompile-preamble -r -m=3`.
+- Confirmed the reported `Invalid argument` abort output came from a binary without the serial retry fallback, then prepared the retry patch for commit, push, and local installation.
