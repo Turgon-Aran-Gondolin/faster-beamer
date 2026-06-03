@@ -12,3 +12,9 @@
 ## 2026-06-04
 
 - Prepared the LaTeX engine-support changes for git commit and push, keeping unrelated generated files out of the commit.
+- Tidied generated workspace artifacts: removed TeX auxiliary/preamble outputs and the temporary visual-comparison folder, while preserving ambiguous source/config scratch files.
+- Investigated a real `lualatex` preamble-precompilation failure in `Changsha.tex`; LuaTeX dumped a usable `.fmt` and then failed during PDF backend shutdown, so faster-beamer now accepts that completed dump and keeps `lualatex` precompilation enabled by default.
+- Provided command-line examples for running `faster-beamer` with `lualatex` and the preamble options.
+- Ran an explicit `lualatex` check with `--precompile-preamble` and `-r` requested, targeting the real `Changsha.tex` deck.
+- Confirmed the explicit `lualatex --precompile-preamble -r` run completed successfully and produced `C:\tmp\fb-changsha-lualatex-explicit-precompile-r.pdf`.
+- Prepared the verified LuaLaTeX preamble-precompilation fix for git commit and push.

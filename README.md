@@ -68,10 +68,11 @@ faster-beamer presentation.tex --engine=xelatex
 faster-beamer presentation.tex --engine=lualatex
 ```
 
-Preamble precompilation with `mylatexformat` is enabled by default for `pdflatex` and `lualatex`, but disabled by default for `xelatex`. XeTeX cannot dump formats for preambles that load native fonts or font mappings, which commonly makes `xelatex --precompile-preamble` fail. You can override the default either way:
+Preamble precompilation with `mylatexformat` is enabled by default for `pdflatex` and `lualatex`, but disabled by default for `xelatex`. XeTeX cannot dump formats for preambles that load native fonts or font mappings. LuaTeX can report a PDF backend error after successfully dumping the format; faster-beamer accepts that generated format when the dump completed. You can override the default either way:
 
 ```bash
 faster-beamer presentation.tex --engine=xelatex --precompile-preamble
+faster-beamer presentation.tex --engine=lualatex --precompile-preamble
 faster-beamer presentation.tex --engine=pdflatex --no-precompile-preamble
 faster-beamer presentation.tex --engine=lualatex --no-precompile-preamble
 ```

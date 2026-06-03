@@ -468,6 +468,23 @@ fn log_command_error(command: &str, context: &str, err: &std::io::Error) {
     }
 }
 
+fn lualatex_format_dump_completed_after_backend_error(format_path: &Path, log_path: &Path) -> bool {
+    if !format_path
+        .metadata()
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    fs::read_to_string(log_path)
+        .map(|log| {
+            log.contains("Beginning to dump on file")
+                && log.contains("(pdf backend): already written content discarded")
+        })
+        .unwrap_or(false)
+}
+
 fn publish_output_file(compiled_pdf: &Path, output_file: &str) -> Result<()> {
     info!("Published PDF: {}", Path::new(output_file).display());
     publish_file(compiled_pdf, Path::new(output_file)).map_err(|err| {
@@ -1837,34 +1854,48 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             }
             Ok(output) if !output.status.success() => {
                 let preamble_log_path = input_dir.join(format!("{}.log", preamble_filename));
-                let stderr = str::from_utf8(&output.stderr).unwrap_or("").trim();
-                let stdout = str::from_utf8(&output.stdout).unwrap_or("").trim();
-                let fallback = if !stderr.is_empty() {
-                    stderr.to_string()
-                } else if !stdout.is_empty() {
-                    stdout.to_string()
-                } else {
-                    String::from("preamble compilation failed")
-                };
-                if let Err(_err) = write_master_log_from_compile_failure(
-                    &original_source_path,
-                    "preamble compilation",
-                    &preamble_log_path,
-                    &fallback,
-                ) {
+                if selected_engine == LatexEngine::LuaLatex
+                    && lualatex_format_dump_completed_after_backend_error(
+                        &preamble_format_path,
+                        &preamble_log_path,
+                    )
+                {
                     warn!(
-                        "Failed to write source log for preamble failure: {}",
-                        original_source_path.display()
+                        "Preamble: lualatex reported a PDF backend error after dumping {}; using the generated format.",
+                        preamble_format_path.display()
                     );
-                }
-                error!(
-                    "Failed to compile preamble! {}",
-                    str::from_utf8(&output.stderr).unwrap()
-                );
-                show_error_slide(&cachedir, &output_file, selected_engine);
+                    info!("Preamble: compiled {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
+                    step_start_time = std::time::Instant::now();
+                } else {
+                    let stderr = str::from_utf8(&output.stderr).unwrap_or("").trim();
+                    let stdout = str::from_utf8(&output.stdout).unwrap_or("").trim();
+                    let fallback = if !stderr.is_empty() {
+                        stderr.to_string()
+                    } else if !stdout.is_empty() {
+                        stdout.to_string()
+                    } else {
+                        String::from("preamble compilation failed")
+                    };
+                    if let Err(_err) = write_master_log_from_compile_failure(
+                        &original_source_path,
+                        "preamble compilation",
+                        &preamble_log_path,
+                        &fallback,
+                    ) {
+                        warn!(
+                            "Failed to write source log for preamble failure: {}",
+                            original_source_path.display()
+                        );
+                    }
+                    error!(
+                        "Failed to compile preamble! {}",
+                        str::from_utf8(&output.stderr).unwrap()
+                    );
+                    show_error_slide(&cachedir, &output_file, selected_engine);
 
-                *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
-                return Err(FasterBeamerError::CompileError);
+                    *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
+                    return Err(FasterBeamerError::CompileError);
+                }
             }
             _ => {
                 info!("Preamble: compiled {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
@@ -2580,5 +2611,40 @@ mod tests {
         );
 
         assert_eq!(first_changed, 0);
+    }
+
+    #[test]
+    fn lualatex_format_dump_accepts_backend_failure_after_dump() {
+        let temp_dir = tempdir().unwrap();
+        let format_path = temp_dir.path().join("preamble.fmt");
+        let log_path = temp_dir.path().join("preamble.log");
+
+        fs::write(&format_path, b"format").unwrap();
+        fs::write(
+            &log_path,
+            "Beginning to dump on file preamble.fmt\n! error:  (pdf backend): already written content discarded, no output file produced.",
+        )
+        .unwrap();
+
+        assert!(super::lualatex_format_dump_completed_after_backend_error(
+            &format_path,
+            &log_path,
+        ));
+    }
+
+    #[test]
+    fn lualatex_format_dump_rejects_failure_before_dump() {
+        let temp_dir = tempdir().unwrap();
+        let format_path = temp_dir.path().join("preamble.fmt");
+        let log_path = temp_dir.path().join("preamble.log");
+
+        fs::write(&format_path, b"format").unwrap();
+        fs::write(&log_path, "! error:  (pdf backend): already written content discarded, no output file produced.")
+            .unwrap();
+
+        assert!(!super::lualatex_format_dump_completed_after_backend_error(
+            &format_path,
+            &log_path,
+        ));
     }
 }
