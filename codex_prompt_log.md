@@ -24,3 +24,7 @@
 - Resumed after the installed retry build produced many LuaLaTeX frame failures during a full parallel verification run and began inspecting whether the retry path or logging needed further adjustment.
 - Identified that `-p` without `--jobs` uses unbounded auto parallelism while `-m=3` is multi-pass, then capped LuaLaTeX auto parallelism at three jobs unless `--jobs` is explicitly supplied.
 - Verified the capped LuaLaTeX auto-parallel build on `Changsha.tex` with `-p --precompile-preamble -r`, producing the expected PDF without frame failures.
+- Explained the LuaLaTeX auto-parallel cap warning and how to override it with explicit `--jobs`.
+- Explained the LuaLaTeX preamble dump warning, where LuaTeX reports a PDF backend shutdown error after producing a usable `.fmt`.
+- Began improving compile-error reporting after feedback that the current version reports LaTeX failures poorly.
+- Reworked LaTeX compile failure reporting to avoid dumping full transcripts, added concise error extraction tests, and verified the terminal output with a temporary failing Beamer fixture.

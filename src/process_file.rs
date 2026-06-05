@@ -13,7 +13,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use log::Level::Trace;
 
-use crate::latexcompile::{LatexCompiler, LatexInput, LatexRunOptions};
+use crate::latexcompile::{summarize_command_output, LatexCompiler, LatexInput, LatexRunOptions};
 use clap::ArgMatches;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -218,28 +218,33 @@ fn frame_preview(frame_text: &str) -> String {
 fn log_frame_compile_failures(
     failures: &[FrameCompileFailure],
     source_file: &Path,
+    cache_subdir: &Path,
     frame_count: usize,
 ) {
+    let source_log = source_file.with_extension("log");
     error!(
-        "Compilation aborted: {} frame build(s) failed.",
-        failures.len()
+        "Compilation aborted: {} frame build(s) failed. Details were written to {}.",
+        failures.len(),
+        source_log.display()
     );
 
     for failure in failures {
         let source_end_line = failure
             .source_start_line
             .saturating_add(failure.source_line_count.saturating_sub(1));
+        let frame_log = cache_subdir.join(Path::new(&failure.temp_file_name).with_extension("log"));
 
         error!(
-            "Frame {}/{} ({}:{}-{} -> {}): {}",
+            "Frame {}/{} failed at {}:{}-{}.",
             failure.frame_idx + 1,
             frame_count,
             source_file.display(),
             failure.source_start_line,
-            source_end_line,
-            failure.temp_file.display(),
-            failure.error
+            source_end_line
         );
+        error!("Reason: {}", failure.error);
+        error!("Generated source: {}", failure.temp_file.display());
+        error!("Frame log: {}", frame_log.display());
 
         if !failure.frame_preview.is_empty() {
             error!("Frame preview: {}", failure.frame_preview);
@@ -1397,7 +1402,11 @@ fn compile_united_artifacts(
                 original_source_path.display()
             );
         }
-        error!("Failed to run united TeX compile!\n{}", error_message);
+        error!(
+            "Failed to run united TeX compile. Details were written to {}.",
+            original_source_path.with_extension("log").display()
+        );
+        error!("Reason: {}", error_message);
     }
 
     if united_pdf.is_file() {
@@ -1917,10 +1926,14 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                             original_source_path.display()
                         );
                     }
+                    let summary = summarize_command_output(stderr, stdout);
                     error!(
-                        "Failed to compile preamble! {}",
-                        str::from_utf8(&output.stderr).unwrap()
+                        "Failed to compile preamble. Details were written to {}.",
+                        original_source_path.with_extension("log").display()
                     );
+                    if !summary.is_empty() {
+                        error!("Reason: {}", summary);
+                    }
                     show_error_slide(&cachedir, &output_file, selected_engine);
 
                     *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
@@ -2351,7 +2364,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 original_source_path.display()
             );
         }
-        log_frame_compile_failures(&failed_compiles, &original_source_path, frames.len());
+        log_frame_compile_failures(
+            &failed_compiles,
+            &original_source_path,
+            &cache_subdir,
+            frames.len(),
+        );
         show_error_slide(&cachedir, &output_file, selected_engine);
         *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
         return Err(FasterBeamerError::CompileError);

@@ -141,7 +141,7 @@ pub enum LatexError {
 impl fmt::Display for LatexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LatexError(message) => write!(f, "General failure: {}.", message),
+            Self::LatexError(message) => write!(f, "{}", message),
             Self::Input(err) => write!(f, "Failed to convert input {}", err),
             Self::Io(err) => write!(f, "{}", err),
         }
@@ -378,18 +378,11 @@ impl LatexCompiler {
         let stderr = str::from_utf8(&output.stderr).unwrap_or("").trim();
         let stdout = str::from_utf8(&output.stdout).unwrap_or("").trim();
         let mut err_msg = format!("{} failed for {}", command, target);
+        let output_summary = summarize_command_output(stderr, stdout);
 
-        if !stderr.is_empty() {
+        if !output_summary.is_empty() {
             err_msg.push_str(": ");
-            err_msg.push_str(stderr);
-        } else if !stdout.is_empty() {
-            err_msg.push_str(": ");
-            err_msg.push_str(stdout);
-        }
-
-        error!("{}", &err_msg);
-        if !stdout.is_empty() {
-            error!("{}", stdout);
+            err_msg.push_str(&output_summary);
         }
 
         Err(LatexError::LatexError(err_msg))
@@ -430,4 +423,118 @@ impl LatexCompiler {
 
 fn tex_path_arg(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+pub(crate) fn summarize_command_output(stderr: &str, stdout: &str) -> String {
+    let preferred = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    let mut lines = important_latex_output_lines(preferred);
+    if lines.is_empty() {
+        lines = preferred
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(8)
+            .map(str::to_owned)
+            .collect();
+    }
+
+    truncate_summary(&lines.join("\n"))
+}
+
+fn important_latex_output_lines(output: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut include_following = 0usize;
+
+    for line in output.lines() {
+        let line = line.trim_end();
+        let trimmed = line.trim_start();
+        let important = is_important_latex_output_line(trimmed);
+
+        if important || include_following > 0 {
+            lines.push(line.to_owned());
+            if important {
+                include_following = 2;
+            } else {
+                include_following = include_following.saturating_sub(1);
+            }
+        }
+
+        if lines.len() >= 12 {
+            break;
+        }
+    }
+
+    lines
+}
+
+fn is_important_latex_output_line(line: &str) -> bool {
+    line.starts_with('!')
+        || line.starts_with("l.")
+        || line.starts_with("fatal:")
+        || line.contains("Fatal error")
+        || line.contains("Emergency stop")
+        || line.contains("Invalid argument")
+        || line.contains("Undefined control sequence")
+        || line.contains("LaTeX Error")
+}
+
+fn truncate_summary(summary: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 2000;
+
+    if summary.chars().count() <= MAX_SUMMARY_CHARS {
+        return summary.to_owned();
+    }
+
+    let mut truncated: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
+    truncated.push_str("\n... output truncated; see the .log file for full details");
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_output_summary_extracts_tex_error_lines() {
+        let stdout = "\
+This is LuaHBTeX
+Document Class: beamer
+! Undefined control sequence.
+l.42 \\badcommand
+next context line
+another context line
+Output written on failed.pdf
+";
+
+        let summary = summarize_command_output("", stdout);
+
+        assert!(summary.contains("! Undefined control sequence."));
+        assert!(summary.contains("l.42 \\badcommand"));
+        assert!(!summary.contains("Document Class: beamer"));
+        assert!(!summary.contains("Output written on failed.pdf"));
+    }
+
+    #[test]
+    fn command_output_summary_prefers_stderr() {
+        let summary = summarize_command_output(
+            "lualatex.exe: c:/texlive/foo.sty: Invalid argument",
+            "! Undefined control sequence.\nl.1 \\bad",
+        );
+
+        assert_eq!(
+            summary,
+            "lualatex.exe: c:/texlive/foo.sty: Invalid argument"
+        );
+    }
+
+    #[test]
+    fn latex_error_display_is_not_wrapped() {
+        let error = LatexError::LatexError(String::from("lualatex failed"));
+
+        assert_eq!(format!("{}", error), "lualatex failed");
+    }
 }
