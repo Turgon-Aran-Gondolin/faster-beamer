@@ -65,3 +65,8 @@
 - Added regression tests for stale cache pruning and cleanup-stamp throttling, then verified the suite with `cargo test`.
 - Explained why files accumulate in the faster-beamer cache: frame-level incremental compilation, LaTeX sidecar output, precompiled preambles, and interrupted or failed builds can leave reusable or stale artifacts behind.
 - Prepared the tracked faster-beamer changes for git commit and push while leaving local untracked scratch files out of the commit.
+- Discussed a latexmk-style guard process design where repeated faster-beamer calls for the same input file are redirected to one long-lived per-file daemon.
+- Implemented a first guard-process path for watch mode: per-input guard metadata under the faster-beamer cache, localhost IPC rebuild requests, strict option matching, and a rebuild channel in the watcher loop.
+- Investigated Windows `os error 32` stale sidecar cleanup warnings and extended retry backoff for transient file locks before reporting cleanup failure.
+- Extended stale sidecar cleanup to cover static TeX dependencies from `\input` and `\include`, preserving source files while clearing cached LaTeX sidecars.
+- Prepared guard-process and stale sidecar cleanup changes for git commit and push, excluding local scratch files from the commit.

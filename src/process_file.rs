@@ -1916,21 +1916,24 @@ fn compiled_pdf_path(cache_subdir: &Path, temp_file_name: &str) -> PathBuf {
 }
 
 fn remove_file_if_exists_with_retries(path: &Path) -> std::io::Result<()> {
-    const REMOVE_ATTEMPTS: usize = 5;
-    const REMOVE_RETRY_DELAY_MS: u64 = 25;
+    const REMOVE_RETRY_DELAYS_MS: [u64; 8] = [25, 50, 75, 100, 150, 200, 300, 500];
 
-    for attempt in 1..=REMOVE_ATTEMPTS {
+    for delay_ms in REMOVE_RETRY_DELAYS_MS {
         match fs::remove_file(path) {
             Ok(_) => return Ok(()),
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(err) if attempt < REMOVE_ATTEMPTS && is_transient_file_lock(&err) => {
-                std::thread::sleep(std::time::Duration::from_millis(REMOVE_RETRY_DELAY_MS));
+            Err(err) if is_transient_file_lock(&err) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             }
             Err(err) => return Err(err),
         }
     }
 
-    Ok(())
+    match fs::remove_file(path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn is_transient_file_lock(err: &std::io::Error) -> bool {
@@ -1944,6 +1947,48 @@ fn remove_frame_job_sidecars(cache_subdir: &Path, temp_file_name: &str) -> std::
         let path = cache_subdir.join(Path::new(temp_file_name).with_extension(extension));
         if let Err(err) = remove_file_if_exists_with_retries(&path) {
             first_error.get_or_insert(err);
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn dependency_sidecar_path(
+    cache_subdir: &Path,
+    input_dir: &Path,
+    dependency: &Path,
+    extension: &str,
+) -> PathBuf {
+    let cache_relative_path = dependency
+        .strip_prefix(input_dir)
+        .ok()
+        .or_else(|| dependency.file_name().map(Path::new))
+        .unwrap_or(dependency);
+
+    cache_subdir
+        .join(cache_relative_path)
+        .with_extension(extension)
+}
+
+fn remove_dependency_job_sidecars(
+    cache_subdir: &Path,
+    input_dir: &Path,
+    dependencies: &[PathBuf],
+) -> std::io::Result<()> {
+    let mut first_error = None;
+
+    for dependency in dependencies
+        .iter()
+        .filter(|dependency| has_tex_extension(dependency))
+    {
+        for extension in FRAME_JOB_SIDECAR_EXTENSIONS {
+            let path = dependency_sidecar_path(cache_subdir, input_dir, dependency, extension);
+            if let Err(err) = remove_file_if_exists_with_retries(&path) {
+                first_error.get_or_insert(err);
+            }
         }
     }
 
@@ -2803,119 +2848,116 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let latex_input = LatexInput::new();
     let compile_failures: Mutex<Vec<FrameCompileFailure>> = Mutex::new(Vec::new());
 
-    let run_document =
-        |frame_idx: usize, document: &GeneratedDocument| -> Option<FrameCompileFailure> {
-            let (source_start_line, source_line_count) = frame_source_lines[frame_idx];
-            let temp_file = input_dir.join(&document.sync_map.temp_file_name);
-            let frame_preview = frame_preview(&frames[frame_idx]);
-            let mut support_paths = Vec::new();
+    let run_document = |frame_idx: usize,
+                        document: &GeneratedDocument|
+     -> Option<FrameCompileFailure> {
+        let (source_start_line, source_line_count) = frame_source_lines[frame_idx];
+        let temp_file = input_dir.join(&document.sync_map.temp_file_name);
+        let frame_preview = frame_preview(&frames[frame_idx]);
+        let mut support_paths = Vec::new();
 
-            if write(&temp_file, &document.tex_content).is_ok() {
-                if let Err(err) =
-                    remove_frame_job_sidecars(&cache_subdir, &document.sync_map.temp_file_name)
+        if write(&temp_file, &document.tex_content).is_ok() {
+            if let Err(err) =
+                remove_frame_job_sidecars(&cache_subdir, &document.sync_map.temp_file_name)
+            {
+                warn!(
+                    "Failed to remove stale frame sidecar files for {}: {}",
+                    document.sync_map.temp_file_name, err
+                );
+            }
+            if let Err(err) =
+                remove_dependency_job_sidecars(&cache_subdir, &input_dir, &document.dependencies)
+            {
+                warn!(
+                    "Failed to remove stale input/include sidecar files for {}: {}",
+                    document.sync_map.temp_file_name, err
+                );
+            }
+
+            for support_file in &document.support_files {
+                let support_path = cache_subdir.join(
+                    Path::new(&document.sync_map.temp_file_name)
+                        .with_extension(support_file.extension),
+                );
+
+                match write(&support_path, &support_file.content) {
+                    Ok(_) => support_paths.push(support_path),
+                    Err(err) => warn!(
+                        "Failed to write temporary support file {}: {}",
+                        support_path.display(),
+                        err
+                    ),
+                }
+            }
+
+            let compiler = apply_compiler_options(
+                LatexCompiler::new_in_with_engine(cache_subdir.clone(), selected_engine)
+                    .add_arg("-shell-escape")
+                    .add_arg("-interaction=nonstopmode")
+                    .with_current_dir(input_dir.clone()),
+                &compiler_options,
+            );
+            let document_run_options = if document.support_files.is_empty() {
+                run_options
+            } else {
+                run_options
+                    .with_latex_pass_count(1)
+                    .with_bibliography_tool(None)
+            };
+
+            let result = compiler.run(
+                Path::new(tex_input_name(&temp_file)),
+                &latex_input,
+                document_run_options,
+            );
+            let compile_error = match result {
+                Ok(compiled_pdf) => validate_compiled_pdf(&compiled_pdf).err().map(|err| {
+                    format!(
+                        "Generated PDF {} is incomplete or unreadable: {}",
+                        compiled_pdf.display(),
+                        err
+                    )
+                }),
+                Err(err) => Some(format!("{}", err)),
+            };
+
+            if compile_error.is_none() {
+                if update_dependency_manifest(&cache_subdir, &document.sync_map.temp_file_name)
+                    .is_err()
                 {
                     warn!(
-                        "Failed to remove stale frame sidecar files for {}: {}",
-                        document.sync_map.temp_file_name, err
+                        "Failed to update dependency manifest for {}",
+                        document.sync_map.temp_file_name
                     );
                 }
-
-                for support_file in &document.support_files {
-                    let support_path = cache_subdir.join(
-                        Path::new(&document.sync_map.temp_file_name)
-                            .with_extension(support_file.extension),
+                if let Err(err) = remove_file_if_exists_with_retries(&temp_file) {
+                    warn!(
+                        "Failed to remove temporary frame source {}: {}",
+                        temp_file.display(),
+                        err
                     );
-
-                    match write(&support_path, &support_file.content) {
-                        Ok(_) => support_paths.push(support_path),
-                        Err(err) => warn!(
-                            "Failed to write temporary support file {}: {}",
+                }
+                for support_path in &support_paths {
+                    if let Err(err) = remove_file_if_exists_with_retries(support_path) {
+                        warn!(
+                            "Failed to remove temporary support file {}: {}",
                             support_path.display(),
                             err
-                        ),
-                    }
-                }
-
-                let compiler = apply_compiler_options(
-                    LatexCompiler::new_in_with_engine(cache_subdir.clone(), selected_engine)
-                        .add_arg("-shell-escape")
-                        .add_arg("-interaction=nonstopmode")
-                        .with_current_dir(input_dir.clone()),
-                    &compiler_options,
-                );
-                let document_run_options = if document.support_files.is_empty() {
-                    run_options
-                } else {
-                    run_options
-                        .with_latex_pass_count(1)
-                        .with_bibliography_tool(None)
-                };
-
-                let result = compiler.run(
-                    Path::new(tex_input_name(&temp_file)),
-                    &latex_input,
-                    document_run_options,
-                );
-                let compile_error = match result {
-                    Ok(compiled_pdf) => validate_compiled_pdf(&compiled_pdf).err().map(|err| {
-                        format!(
-                            "Generated PDF {} is incomplete or unreadable: {}",
-                            compiled_pdf.display(),
-                            err
-                        )
-                    }),
-                    Err(err) => Some(format!("{}", err)),
-                };
-
-                if compile_error.is_none() {
-                    if update_dependency_manifest(&cache_subdir, &document.sync_map.temp_file_name)
-                        .is_err()
-                    {
-                        warn!(
-                            "Failed to update dependency manifest for {}",
-                            document.sync_map.temp_file_name
                         );
                     }
-                    if let Err(err) = remove_file_if_exists_with_retries(&temp_file) {
-                        warn!(
-                            "Failed to remove temporary frame source {}: {}",
-                            temp_file.display(),
-                            err
-                        );
-                    }
-                    for support_path in &support_paths {
-                        if let Err(err) = remove_file_if_exists_with_retries(support_path) {
-                            warn!(
-                                "Failed to remove temporary support file {}: {}",
-                                support_path.display(),
-                                err
-                            );
-                        }
-                    }
-                    trace!("Compiled file {}", &temp_file.to_str().unwrap());
-                    None
-                } else {
-                    for support_path in &support_paths {
-                        if let Err(err) = remove_file_if_exists_with_retries(support_path) {
-                            warn!(
-                                "Failed to remove temporary support file {}: {}",
-                                support_path.display(),
-                                err
-                            );
-                        }
-                    }
-                    Some(FrameCompileFailure {
-                        frame_idx,
-                        source_start_line,
-                        source_line_count,
-                        temp_file: temp_file.clone(),
-                        temp_file_name: document.sync_map.temp_file_name.clone(),
-                        sync_segments: document.sync_map.segments.clone(),
-                        frame_preview,
-                        error: compile_error.unwrap(),
-                    })
                 }
+                trace!("Compiled file {}", &temp_file.to_str().unwrap());
+                None
             } else {
+                for support_path in &support_paths {
+                    if let Err(err) = remove_file_if_exists_with_retries(support_path) {
+                        warn!(
+                            "Failed to remove temporary support file {}: {}",
+                            support_path.display(),
+                            err
+                        );
+                    }
+                }
                 Some(FrameCompileFailure {
                     frame_idx,
                     source_start_line,
@@ -2924,10 +2966,22 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     temp_file_name: document.sync_map.temp_file_name.clone(),
                     sync_segments: document.sync_map.segments.clone(),
                     frame_preview,
-                    error: String::from("Failed to write generated frame source to disk."),
+                    error: compile_error.unwrap(),
                 })
             }
-        };
+        } else {
+            Some(FrameCompileFailure {
+                frame_idx,
+                source_start_line,
+                source_line_count,
+                temp_file: temp_file.clone(),
+                temp_file_name: document.sync_map.temp_file_name.clone(),
+                sync_segments: document.sync_map.segments.clone(),
+                frame_preview,
+                error: String::from("Failed to write generated frame source to disk."),
+            })
+        }
+    };
 
     let set_compile_job_state =
         |frame_map: &std::sync::Arc<std::sync::Mutex<Vec<(char, FrameLabel)>>>,
@@ -3592,6 +3646,50 @@ A\n\
         assert!(!synctex_path.exists());
         assert!(pdf_path.exists());
         assert!(deps_path.exists());
+    }
+
+    #[test]
+    fn remove_dependency_job_sidecars_clears_input_auxiliary_files() {
+        let temp_dir = tempdir().unwrap();
+        let input_dir = temp_dir.path().join("deck");
+        let cache_dir = temp_dir.path().join("cache");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let input_path = input_dir.join("shared.tex");
+        let aux_path = cache_dir.join("shared.aux");
+        let toc_path = cache_dir.join("shared.toc");
+        let tex_path = cache_dir.join("shared.tex");
+
+        fs::write(&input_path, "shared").unwrap();
+        fs::write(&aux_path, "aux").unwrap();
+        fs::write(&toc_path, "toc").unwrap();
+        fs::write(&tex_path, "tex").unwrap();
+
+        super::remove_dependency_job_sidecars(&cache_dir, &input_dir, &[input_path]).unwrap();
+
+        assert!(!aux_path.exists());
+        assert!(!toc_path.exists());
+        assert!(tex_path.exists());
+    }
+
+    #[test]
+    fn remove_dependency_job_sidecars_preserves_relative_subdirectories() {
+        let temp_dir = tempdir().unwrap();
+        let input_dir = temp_dir.path().join("deck");
+        let cache_dir = temp_dir.path().join("cache");
+        let include_dir = input_dir.join("parts");
+        let cached_include_dir = cache_dir.join("parts");
+        fs::create_dir_all(&include_dir).unwrap();
+        fs::create_dir_all(&cached_include_dir).unwrap();
+        let input_path = include_dir.join("chapter.tex");
+        let aux_path = cached_include_dir.join("chapter.aux");
+
+        fs::write(&input_path, "chapter").unwrap();
+        fs::write(&aux_path, "aux").unwrap();
+
+        super::remove_dependency_job_sidecars(&cache_dir, &input_dir, &[input_path]).unwrap();
+
+        assert!(!aux_path.exists());
     }
 
     #[test]

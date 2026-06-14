@@ -5,21 +5,72 @@ extern crate lazy_static;
 
 mod beamer;
 mod fs_utils;
+mod guard;
 mod latexcompile;
 mod parsing;
 mod process_file;
 mod tree_traversal;
 
 use clap::{App, Arg};
+use guard::RedirectResult;
 use process_file::FasterBeamerError;
 use std::env;
 use std::env::current_dir;
+use std::sync::mpsc;
 use std::{thread, time};
 
 const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex --engine=xelatex\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
 
 fn watch_label(input_file: &str) -> String {
     format!("Watch: monitoring {}", input_file)
+}
+
+fn build_mode_arg(matches: &clap::ArgMatches) -> &'static str {
+    if matches.is_present("pdfunite-synctex") {
+        "pdfunite-synctex"
+    } else if matches.is_present("pdfunite") {
+        "pdfunite"
+    } else if matches.is_present("tex-unite") {
+        "tex-unite"
+    } else {
+        "preview"
+    }
+}
+
+fn guard_fingerprint(matches: &clap::ArgMatches, output_file: &str) -> String {
+    guard::invocation_fingerprint(
+        build_mode_arg(matches),
+        output_file,
+        matches.is_present("frame-numbers"),
+        matches.is_present("tree-sitter"),
+        matches.value_of("multi-pass"),
+        matches.value_of("bibliography"),
+        matches.value_of("engine").unwrap_or("pdflatex"),
+        matches.is_present("precompile-preamble"),
+        matches.is_present("no-precompile-preamble"),
+        matches.is_present("force-recompile"),
+        matches.is_present("parallel"),
+        matches.value_of("jobs"),
+        matches
+            .values_of("compiler-option")
+            .map(|values| values.collect())
+            .unwrap_or_default(),
+    )
+}
+
+fn default_output_file(input_path: &std::path::Path) -> String {
+    input_path
+        .with_extension("pdf")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn output_file_arg(matches: &clap::ArgMatches, input_path: &std::path::Path) -> String {
+    matches
+        .value_of("output")
+        .or_else(|| matches.value_of("OUTPUT"))
+        .map(|output| output.to_owned())
+        .unwrap_or_else(|| default_output_file(input_path))
 }
 
 fn main() {
@@ -190,8 +241,13 @@ fn main() {
         .get_matches();
 
     let is_watch_mode = matches.is_present("watch");
-    let input_file = matches.value_of("INPUT").unwrap();
-    let resolved_input_file = process_file::resolve_input_file(input_file);
+    let input_file = matches.value_of("INPUT").unwrap().to_owned();
+    let resolved_input_file = process_file::resolve_input_file(&input_file);
+    let canonical_input_file = resolved_input_file
+        .canonicalize()
+        .unwrap_or_else(|_| resolved_input_file.clone());
+    let output_file = output_file_arg(&matches, &resolved_input_file);
+    let fingerprint = guard_fingerprint(&matches, &output_file);
 
     let cwd = current_dir().unwrap();
     let input_dir = resolved_input_file
@@ -202,7 +258,7 @@ fn main() {
 
     info!("Build requested: {}", input_file);
     if matches.is_present("clean") {
-        let result = process_file::clean_generated_artifacts(input_file, &matches);
+        let result = process_file::clean_generated_artifacts(&input_file, &matches);
         if result == Err(FasterBeamerError::InputFileNotExistent)
             || result == Err(FasterBeamerError::IoError)
         {
@@ -211,7 +267,48 @@ fn main() {
         return;
     }
 
-    let result = process_file::process_file(input_file, &matches);
+    match guard::redirect_to_guard(&canonical_input_file, &fingerprint) {
+        RedirectResult::Redirected => {
+            info!(
+                "Guard: redirected rebuild request for {}.",
+                canonical_input_file.display()
+            );
+            return;
+        }
+        RedirectResult::DifferentOptions => {
+            error!(
+                "Guard: a watcher is already running for {} with different build options.",
+                canonical_input_file.display()
+            );
+            std::process::exit(-1);
+        }
+        RedirectResult::NoGuard => {}
+        RedirectResult::IoError => {
+            error!(
+                "Guard: failed to contact existing watcher for {}.",
+                canonical_input_file.display()
+            );
+            std::process::exit(-1);
+        }
+    }
+
+    let (guard_registration, rebuild_rx) = if is_watch_mode {
+        let (rebuild_tx, rebuild_rx) = mpsc::channel();
+        let registration = guard::start_guard(&canonical_input_file, &fingerprint, rebuild_tx)
+            .map_err(|err| {
+                error!(
+                    "Guard: failed to start for {}: {}",
+                    canonical_input_file.display(),
+                    err
+                );
+            })
+            .ok();
+        (registration, Some(rebuild_rx))
+    } else {
+        (None, None)
+    };
+
+    let result = process_file::process_file(&input_file, &matches);
     if result == Err(FasterBeamerError::InputFileNotExistent)
         || result == Err(FasterBeamerError::IoError)
     {
@@ -220,7 +317,10 @@ fn main() {
 
     if is_watch_mode {
         use hotwatch::{Event, Hotwatch};
-        let matches = matches.clone();
+        let watch_matches = matches.clone();
+        let guard_matches = matches.clone();
+        let rebuild_rx = rebuild_rx.unwrap();
+        let _guard_registration = guard_registration;
 
         let mut hotwatch = Hotwatch::new().expect("Hotwatch failed to initialize.");
         hotwatch
@@ -228,7 +328,7 @@ fn main() {
                 Event::Write(file) | Event::NoticeRemove(file) => {
                     trace!("{:?} has changed.", file);
                     thread::sleep(time::Duration::from_millis(50));
-                    let input_file = matches.value_of("INPUT").unwrap();
+                    let input_file = watch_matches.value_of("INPUT").unwrap();
                     match (
                         process_file::resolve_input_file(input_file).canonicalize(),
                         file.canonicalize(),
@@ -236,7 +336,7 @@ fn main() {
                         (Ok(file), Ok(changed_file)) if file == changed_file => {
                             let path_str = file.to_str().unwrap();
                             info!("Rebuild triggered: source changed at {}", &path_str);
-                            let _result = process_file::process_file(path_str, &matches);
+                            let _result = process_file::process_file(path_str, &watch_matches);
                         }
                         _ => {}
                     }
@@ -246,10 +346,17 @@ fn main() {
                 }
             })
             .expect("Failed to watch file!");
-        info!("{}", watch_label(input_file));
+        info!("{}", watch_label(&input_file));
 
         loop {
-            thread::sleep(time::Duration::from_millis(100));
+            if rebuild_rx
+                .recv_timeout(time::Duration::from_millis(100))
+                .is_ok()
+            {
+                let input_file = guard_matches.value_of("INPUT").unwrap();
+                info!("Rebuild triggered: guard request for {}", input_file);
+                let _result = process_file::process_file(input_file, &guard_matches);
+            }
         }
     }
 }
