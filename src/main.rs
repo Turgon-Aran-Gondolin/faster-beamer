@@ -11,11 +11,10 @@ mod process_file;
 mod tree_traversal;
 
 use clap::{App, Arg};
+use process_file::FasterBeamerError;
 use std::env;
 use std::env::current_dir;
-use std::path::Path;
 use std::{thread, time};
-use process_file::FasterBeamerError;
 
 const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex --engine=xelatex\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
 
@@ -192,9 +191,10 @@ fn main() {
 
     let is_watch_mode = matches.is_present("watch");
     let input_file = matches.value_of("INPUT").unwrap();
+    let resolved_input_file = process_file::resolve_input_file(input_file);
 
     let cwd = current_dir().unwrap();
-    let input_dir = Path::new(input_file)
+    let input_dir = resolved_input_file
         .parent()
         .unwrap_or(&cwd)
         .canonicalize()
@@ -203,14 +203,18 @@ fn main() {
     info!("Build requested: {}", input_file);
     if matches.is_present("clean") {
         let result = process_file::clean_generated_artifacts(input_file, &matches);
-        if result == Err(FasterBeamerError::InputFileNotExistent) || result == Err(FasterBeamerError::IoError) {
+        if result == Err(FasterBeamerError::InputFileNotExistent)
+            || result == Err(FasterBeamerError::IoError)
+        {
             std::process::exit(-1);
         };
         return;
     }
 
     let result = process_file::process_file(input_file, &matches);
-    if result == Err(FasterBeamerError::InputFileNotExistent) || result == Err(FasterBeamerError::IoError) {
+    if result == Err(FasterBeamerError::InputFileNotExistent)
+        || result == Err(FasterBeamerError::IoError)
+    {
         std::process::exit(-1);
     };
 
@@ -225,7 +229,10 @@ fn main() {
                     trace!("{:?} has changed.", file);
                     thread::sleep(time::Duration::from_millis(50));
                     let input_file = matches.value_of("INPUT").unwrap();
-                    match (Path::new(&input_file).canonicalize(), file.canonicalize()) {
+                    match (
+                        process_file::resolve_input_file(input_file).canonicalize(),
+                        file.canonicalize(),
+                    ) {
                         (Ok(file), Ok(changed_file)) if file == changed_file => {
                             let path_str = file.to_str().unwrap();
                             info!("Rebuild triggered: source changed at {}", &path_str);

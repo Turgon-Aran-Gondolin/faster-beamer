@@ -190,7 +190,10 @@ mod tests {
     #[test]
     fn keeps_relative_paths_stable() {
         let relative = Path::new("slides/assets");
-        assert_eq!(cache_relative_path(relative), PathBuf::from("slides").join("assets"));
+        assert_eq!(
+            cache_relative_path(relative),
+            PathBuf::from("slides").join("assets")
+        );
     }
 
     #[cfg(windows)]
@@ -241,8 +244,8 @@ mod tests {
         let nested_file = nested_dir.join("asset.txt");
         fs::write(&nested_file, "asset").unwrap();
 
-        let staged_dir = stage_directory_into(cache_dir.path(), &source_dir.path().join("images"))
-            .unwrap();
+        let staged_dir =
+            stage_directory_into(cache_dir.path(), &source_dir.path().join("images")).unwrap();
 
         assert!(staged_dir.join("nested").join("asset.txt").exists());
     }

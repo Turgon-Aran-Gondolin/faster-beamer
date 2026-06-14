@@ -31,7 +31,7 @@
 //! use std::fs::write;
 //! use latexcompile::{LatexCompiler, LatexInput, LatexError};
 //!
-//! 
+//!
 //!     // create the template map
 //!     let mut dict = HashMap::new();
 //!     dict.insert("test".into(), "Minimal".into());
@@ -179,7 +179,7 @@ impl LatexInput {
     /// ## Example
     /// ```
     /// # use latexcompile::{LatexCompiler, LatexInput, LatexError};
-    /// 
+    ///
     ///   let mut input = LatexInput::from("assets/main.tex");
     ///   input.add("name.tex", "test".as_bytes().to_vec());
     ///
@@ -201,10 +201,10 @@ impl LatexInput {
     /// ## Example
     /// ```
     /// # use latexcompile::{LatexCompiler, LatexInput, LatexError};
-    /// 
+    ///
     ///   let mut input = LatexInput::from("assets");
     ///   input.add("name.tex", "test".as_bytes().to_vec());
-    /// 
+    ///
     /// ```
     /// ## Note
     /// If the path is not a folder nothing is added.
@@ -285,7 +285,7 @@ impl<'a> From<&'a str> for LatexInput {
 /// use std::collections::HashMap;
 /// use latexcompile::{LatexCompiler, LatexInput, LatexError};
 ///
-/// 
+///
 ///    let compiler = LatexCompiler::new(HashMap::new()).unwrap();
 ///    let input = LatexInput::from("assets");
 ///    let pdf = compiler.run("assets/main.tex", &input);
@@ -401,7 +401,9 @@ impl LatexCompiler {
         let job_name = pdf
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .ok_or_else(|| LatexError::LatexError(format!("Failed to derive job name from {}", main.display())))?;
+            .ok_or_else(|| {
+                LatexError::LatexError(format!("Failed to derive job name from {}", main.display()))
+            })?;
 
         if let Some(tool) = options.bibliography_tool {
             self.run_latex_pass(main)?;

@@ -69,7 +69,6 @@ pub fn get_children<'a>(
     results
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::parsing::ParsedFile;

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
 #[derive(PartialEq)]
@@ -77,6 +77,50 @@ struct GeneratedDocument {
 struct GeneratedSupportFile {
     extension: &'static str,
     content: String,
+}
+
+#[derive(Clone)]
+struct DocumentContextSnippet {
+    content: String,
+    source_start_line: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FrameLabel {
+    Title,
+    Toc,
+    Number(usize),
+}
+
+impl FrameLabel {
+    fn progress_label(&self) -> String {
+        match self {
+            FrameLabel::Title => String::from("title"),
+            FrameLabel::Toc => String::from("toc"),
+            FrameLabel::Number(number) => number.to_string(),
+        }
+    }
+
+    fn status_label(&self, numbered_frame_count: usize) -> String {
+        match self {
+            FrameLabel::Title => String::from("title"),
+            FrameLabel::Toc => String::from("toc"),
+            FrameLabel::Number(number) => {
+                if numbered_frame_count == 0 {
+                    number.to_string()
+                } else {
+                    format!("{}/{}", number, numbered_frame_count)
+                }
+            }
+        }
+    }
+
+    fn counter_value(&self) -> usize {
+        match self {
+            FrameLabel::Number(number) => number.saturating_sub(1),
+            FrameLabel::Title | FrameLabel::Toc => 0,
+        }
+    }
 }
 
 struct UnitedCompileArtifacts {
@@ -137,8 +181,12 @@ lazy_static! {
     static ref TOC_REGEX: Regex = Regex::new(r"\\tableofcontents(?:\s*\[[^\]]*\])?").unwrap();
 }
 lazy_static! {
+    static ref TITLE_PAGE_REGEX: Regex = Regex::new(r"\\(?:titlepage|maketitle)\b").unwrap();
+}
+lazy_static! {
     static ref DYNAMIC_TOC_OPTION_REGEX: Regex =
-        Regex::new(r"\\tableofcontents\s*\[[^\]]*(?:currentsection|currentsubsection)[^\]]*\]").unwrap();
+        Regex::new(r"\\tableofcontents\s*\[[^\]]*(?:currentsection|currentsubsection)[^\]]*\]")
+            .unwrap();
 }
 lazy_static! {
     static ref DOCUMENT_REGEX: Regex =
@@ -186,16 +234,68 @@ const FRAME_TEMP_PREFIX: &str = "faster-beamer-temp-";
 const PREAMBLE_TEMP_PREFIX: &str = "faster-beamer-preamble-";
 const UNITED_TEMP_PREFIX: &str = "faster-beamer-united-";
 const PDFUNITE_TEMP_FILE: &str = "faster-beamer-pdfunite-output.pdf";
+const CACHE_GARBAGE_RETENTION_DAYS: u64 = 30;
+const CACHE_GARBAGE_SWEEP_INTERVAL_HOURS: u64 = 24;
+const CACHE_GARBAGE_SWEEP_STAMP: &str = ".last-garbage-sweep";
 const LUALATEX_AUTO_PARALLEL_JOBS: usize = 3;
 const GRAPHICS_EXTENSIONS: [&str; 6] = ["pdf", "png", "jpg", "jpeg", "eps", "svg"];
 const DEPENDENCY_MANIFEST_EXTENSION: &str = "deps";
+const FRAME_JOB_SIDECAR_EXTENSIONS: [&str; 13] = [
+    "aux",
+    "bcf",
+    "bbl",
+    "blg",
+    "fls",
+    "log",
+    "nav",
+    "out",
+    "run.xml",
+    "snm",
+    "synctex.gz",
+    "toc",
+    "vrb",
+];
 
-fn frame_counter_setup(frame_idx: usize, correct_frame_numbers: bool) -> String {
+fn frame_counter_setup(frame_label: &FrameLabel, correct_frame_numbers: bool) -> String {
     if correct_frame_numbers {
-        format!("\\setcounter{{framenumber}}{{{}}}\n", frame_idx)
+        format!(
+            "\\setcounter{{framenumber}}{{{}}}\n",
+            frame_label.counter_value()
+        )
     } else {
         String::new()
     }
+}
+
+fn frame_number_display_setup(frame_label: &FrameLabel) -> &'static str {
+    match frame_label {
+        FrameLabel::Toc => {
+            "\\makeatletter\n\
+\\def\\insertframenumber{}\n\
+\\setbeamertemplate{page number in head/foot}{}\n\
+\\setbeamertemplate{frame numbering}{}\n\
+\\makeatother\n"
+        }
+        FrameLabel::Title | FrameLabel::Number(_) => "",
+    }
+}
+
+fn numbered_frame_count(frame_labels: &[FrameLabel]) -> usize {
+    frame_labels
+        .iter()
+        .filter(|label| matches!(label, FrameLabel::Number(_)))
+        .count()
+}
+
+fn frame_label_for_index(
+    frame_labels: &[FrameLabel],
+    frame_idx: usize,
+    numbered_frame_count: usize,
+) -> String {
+    frame_labels
+        .get(frame_idx)
+        .map(|label| label.status_label(numbered_frame_count))
+        .unwrap_or_else(|| format!("raw frame {}", frame_idx + 1))
 }
 
 fn frame_preview(frame_text: &str) -> String {
@@ -219,7 +319,8 @@ fn log_frame_compile_failures(
     failures: &[FrameCompileFailure],
     source_file: &Path,
     cache_subdir: &Path,
-    frame_count: usize,
+    frame_labels: &[FrameLabel],
+    numbered_frame_count: usize,
 ) {
     let source_log = source_file.with_extension("log");
     error!(
@@ -235,9 +336,8 @@ fn log_frame_compile_failures(
         let frame_log = cache_subdir.join(Path::new(&failure.temp_file_name).with_extension("log"));
 
         error!(
-            "Frame {}/{} failed at {}:{}-{}.",
-            failure.frame_idx + 1,
-            frame_count,
+            "Frame {} failed at {}:{}-{}.",
+            frame_label_for_index(frame_labels, failure.frame_idx, numbered_frame_count),
             source_file.display(),
             failure.source_start_line,
             source_end_line
@@ -264,9 +364,16 @@ fn map_temp_line_from_segments(segments: &[SyncTexLineSegment], temp_line: usize
     temp_line
 }
 
-fn remap_frame_log_to_source(failure: &FrameCompileFailure, source_file_name: &str, log_content: &str) -> String {
+fn remap_frame_log_to_source(
+    failure: &FrameCompileFailure,
+    source_file_name: &str,
+    log_content: &str,
+) -> String {
     let mut remapped = log_content.replace(&failure.temp_file_name, source_file_name);
-    remapped = remapped.replace(failure.temp_file.to_string_lossy().as_ref(), source_file_name);
+    remapped = remapped.replace(
+        failure.temp_file.to_string_lossy().as_ref(),
+        source_file_name,
+    );
 
     TEX_LOG_LINE_REGEX
         .replace_all(&remapped, |captures: &regex::Captures<'_>| {
@@ -303,7 +410,11 @@ fn remap_log_lines_to_source(
 fn write_master_log(source_file: &Path, content: &str) -> Result<()> {
     let source_log = source_file.with_extension("log");
     fs::write(&source_log, content).map_err(|err| {
-        error!("Failed to write master log {}: {}", source_log.display(), err);
+        error!(
+            "Failed to write master log {}: {}",
+            source_log.display(),
+            err
+        );
         FasterBeamerError::IoError
     })
 }
@@ -382,7 +493,8 @@ fn write_master_log_for_frame_failures(
     failures: &[FrameCompileFailure],
     cache_subdir: &Path,
     source_file: &Path,
-    frame_count: usize,
+    frame_labels: &[FrameLabel],
+    numbered_frame_count: usize,
 ) -> Result<()> {
     let source_file_name = tex_input_name(source_file);
     let mut master_log = String::new();
@@ -394,11 +506,13 @@ fn write_master_log_for_frame_failures(
         let log_path = cache_subdir.join(Path::new(&failure.temp_file_name).with_extension("log"));
 
         master_log.push_str(&format!(
-            "! faster-beamer: frame {}/{} failed to compile\n",
-            failure.frame_idx + 1,
-            frame_count.max(1)
+            "! faster-beamer: frame {} failed to compile\n",
+            frame_label_for_index(frame_labels, failure.frame_idx, numbered_frame_count)
         ));
-        master_log.push_str(&format!("l.{} {}\n", failure.source_start_line, failure.frame_preview));
+        master_log.push_str(&format!(
+            "l.{} {}\n",
+            failure.source_start_line, failure.frame_preview
+        ));
 
         match fs::read_to_string(&log_path) {
             Ok(log_content) => {
@@ -433,14 +547,11 @@ fn compile_progress_bar(total_jobs: usize) -> ProgressBar {
     progress_bar
 }
 
-fn render_frame_map(map: &[(char, usize)]) -> String {
-    let mut out = String::new();
-    for (status, frame_num) in map {
-        out.push_str(&format!("{}{}", frame_num, status));
-        out.push(' ');
-    }
-    out.pop(); // trailing space
-    out
+fn render_frame_map(map: &[(char, FrameLabel)]) -> String {
+    map.iter()
+        .map(|(status, frame_label)| format!("{}{}", frame_label.progress_label(), status))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn show_error_slide(cachedir: &Path, output_file: &str, latex_engine: LatexEngine) {
@@ -453,11 +564,7 @@ fn show_error_slide(cachedir: &Path, output_file: &str, latex_engine: LatexEngin
             .add_arg("-shell-escape")
             .add_arg("-interaction=nonstopmode");
 
-        let _result = compiler.run(
-            &error_file,
-            &LatexInput::new(),
-            LatexRunOptions::new(),
-        );
+        let _result = compiler.run(&error_file, &LatexInput::new(), LatexRunOptions::new());
     }
     if error_pdf.exists() {
         if let Err(err) = publish_file(&error_pdf, Path::new(output_file)) {
@@ -556,30 +663,50 @@ fn rewrite_synctex_to_original(compiled_pdf: &Path, sync_map: &FrameSyncTexMap) 
     }
 
     let compressed = std::fs::read(&synctex_file).map_err(|err| {
-        error!("Failed to read SyncTeX file {}: {}", synctex_file.display(), err);
+        error!(
+            "Failed to read SyncTeX file {}: {}",
+            synctex_file.display(),
+            err
+        );
         FasterBeamerError::IoError
     })?;
 
     let mut decoder = GzDecoder::new(&compressed[..]);
     let mut content = String::new();
     decoder.read_to_string(&mut content).map_err(|err| {
-        error!("Failed to decode SyncTeX file {}: {}", synctex_file.display(), err);
+        error!(
+            "Failed to decode SyncTeX file {}: {}",
+            synctex_file.display(),
+            err
+        );
         FasterBeamerError::IoError
     })?;
 
     let rewritten = remap_synctex_contents(&content, sync_map);
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(rewritten.as_bytes()).map_err(|err| {
-        error!("Failed to encode SyncTeX file {}: {}", synctex_file.display(), err);
+        error!(
+            "Failed to encode SyncTeX file {}: {}",
+            synctex_file.display(),
+            err
+        );
         FasterBeamerError::IoError
     })?;
     let compressed = encoder.finish().map_err(|err| {
-        error!("Failed to finish SyncTeX encoding for {}: {}", synctex_file.display(), err);
+        error!(
+            "Failed to finish SyncTeX encoding for {}: {}",
+            synctex_file.display(),
+            err
+        );
         FasterBeamerError::IoError
     })?;
 
     std::fs::write(&synctex_file, compressed).map_err(|err| {
-        error!("Failed to write SyncTeX file {}: {}", synctex_file.display(), err);
+        error!(
+            "Failed to write SyncTeX file {}: {}",
+            synctex_file.display(),
+            err
+        );
         FasterBeamerError::IoError
     })
 }
@@ -592,7 +719,11 @@ fn remap_synctex_contents(content: &str, sync_map: &FrameSyncTexMap) -> String {
         if let Some((tag, path)) = parse_synctex_input_line(line) {
             if synctex_input_matches(path, &sync_map.temp_file_name) {
                 temp_tag = Some(tag);
-                rewritten_lines.push(format!("Input:{}:{}", tag, synctex_path(&sync_map.source_file)));
+                rewritten_lines.push(format!(
+                    "Input:{}:{}",
+                    tag,
+                    synctex_path(&sync_map.source_file)
+                ));
                 continue;
             }
         }
@@ -631,7 +762,11 @@ fn synctex_input_matches(path: &str, temp_file_name: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn remap_synctex_link_line(line: &str, temp_tag: u32, sync_map: &FrameSyncTexMap) -> Option<String> {
+fn remap_synctex_link_line(
+    line: &str,
+    temp_tag: u32,
+    sync_map: &FrameSyncTexMap,
+) -> Option<String> {
     let first_char = line.chars().next()?;
     if !matches!(first_char, '[' | '(' | 'x' | 'k' | 'g' | '$' | 'v' | 'h') {
         return None;
@@ -672,7 +807,11 @@ fn logical_line_count(text: &str) -> usize {
 }
 
 fn line_number_at(text: &str, byte_idx: usize) -> usize {
-    text[..byte_idx].bytes().filter(|byte| *byte == b'\n').count() + 1
+    text[..byte_idx]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
 }
 
 fn strip_tex_comments(tex: &str) -> String {
@@ -706,8 +845,262 @@ fn strip_tex_comments(tex: &str) -> String {
     stripped
 }
 
+fn strip_tex_comment_from_line(line: &str) -> &str {
+    let mut escaped = false;
+
+    for (idx, ch) in line.char_indices() {
+        if ch == '%' && !escaped {
+            return &line[..idx];
+        }
+
+        if ch == '\\' {
+            escaped = !escaped;
+        } else {
+            escaped = false;
+        }
+    }
+
+    line
+}
+
+fn brace_delta(line: &str) -> isize {
+    let mut escaped = false;
+    let mut delta = 0isize;
+
+    for ch in line.chars() {
+        match ch {
+            '\\' => escaped = !escaped,
+            '{' if !escaped => {
+                delta += 1;
+                escaped = false;
+            }
+            '}' if !escaped => {
+                delta -= 1;
+                escaped = false;
+            }
+            _ => escaped = false,
+        }
+    }
+
+    delta
+}
+
+fn command_name_at_line_start(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let command = trimmed.strip_prefix('\\')?;
+    let end = command
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_alphabetic())
+        .map(|(idx, _)| idx)
+        .unwrap_or(command.len());
+
+    if end == 0 {
+        None
+    } else {
+        Some(&command[..end])
+    }
+}
+
+fn is_document_context_command(command: &str) -> bool {
+    matches!(
+        command,
+        "def"
+            | "gdef"
+            | "edef"
+            | "xdef"
+            | "let"
+            | "newcommand"
+            | "renewcommand"
+            | "providecommand"
+            | "DeclareRobustCommand"
+            | "NewDocumentCommand"
+            | "RenewDocumentCommand"
+            | "ProvideDocumentCommand"
+            | "DeclareDocumentCommand"
+            | "newenvironment"
+            | "renewenvironment"
+            | "NewDocumentEnvironment"
+            | "RenewDocumentEnvironment"
+            | "ProvideDocumentEnvironment"
+            | "DeclareDocumentEnvironment"
+            | "newtheorem"
+            | "theoremstyle"
+            | "newlength"
+            | "setlength"
+            | "addtolength"
+            | "settowidth"
+            | "settoheight"
+            | "settodepth"
+            | "newcounter"
+            | "setcounter"
+            | "addtocounter"
+            | "counterwithin"
+            | "counterwithout"
+            | "definecolor"
+            | "colorlet"
+            | "tikzset"
+            | "pgfplotsset"
+            | "hypersetup"
+            | "lstset"
+            | "setminted"
+            | "setbeamertemplate"
+            | "setbeamercolor"
+            | "setbeamerfont"
+            | "makeatletter"
+            | "makeatother"
+            | "ExplSyntaxOn"
+            | "ExplSyntaxOff"
+    ) || command.starts_with("Declare")
+        || command.starts_with("New")
+        || command.starts_with("Renew")
+        || command.starts_with("Provide")
+}
+
+fn extract_document_context_snippets(
+    source_content: &str,
+    segment_start_idx: usize,
+    segment: &str,
+) -> Vec<DocumentContextSnippet> {
+    let mut snippets = Vec::new();
+    let mut collecting = false;
+    let mut collected = String::new();
+    let mut collected_start_idx = 0usize;
+    let mut balance = 0isize;
+    let mut segment_offset = 0usize;
+
+    for line in segment.split_inclusive('\n') {
+        let uncommented = strip_tex_comment_from_line(line);
+
+        if collecting {
+            collected.push_str(line);
+            balance += brace_delta(uncommented);
+
+            if balance <= 0 {
+                snippets.push(DocumentContextSnippet {
+                    content: collected.clone(),
+                    source_start_line: line_number_at(source_content, collected_start_idx),
+                });
+                collected.clear();
+                collecting = false;
+                balance = 0;
+            }
+        } else if command_name_at_line_start(uncommented)
+            .map(is_document_context_command)
+            .unwrap_or(false)
+        {
+            collected_start_idx = segment_start_idx + segment_offset;
+            collected.push_str(line);
+            balance = brace_delta(uncommented);
+
+            if balance <= 0 {
+                snippets.push(DocumentContextSnippet {
+                    content: collected.clone(),
+                    source_start_line: line_number_at(source_content, collected_start_idx),
+                });
+                collected.clear();
+                balance = 0;
+            } else {
+                collecting = true;
+            }
+        }
+
+        segment_offset += line.len();
+    }
+
+    if collecting && !collected.is_empty() {
+        snippets.push(DocumentContextSnippet {
+            content: collected,
+            source_start_line: line_number_at(source_content, collected_start_idx),
+        });
+    }
+
+    snippets
+}
+
+fn document_contexts_before_frames(
+    source_content: &str,
+    frame_ranges: &[(usize, usize)],
+    document_begin_idx: Option<usize>,
+) -> Vec<Vec<DocumentContextSnippet>> {
+    let document_start_idx = document_begin_idx
+        .map(|idx| idx + "\\begin{document}".len())
+        .unwrap_or(0);
+    let mut contexts = Vec::with_capacity(frame_ranges.len());
+    let mut accumulated = Vec::new();
+    let mut source_cursor = document_start_idx;
+
+    for (frame_start_idx, frame_end_idx) in frame_ranges {
+        if *frame_start_idx >= document_start_idx {
+            if source_cursor < *frame_start_idx {
+                accumulated.extend(extract_document_context_snippets(
+                    source_content,
+                    source_cursor,
+                    &source_content[source_cursor..*frame_start_idx],
+                ));
+            }
+            contexts.push(accumulated.clone());
+            source_cursor = *frame_end_idx;
+        } else {
+            contexts.push(Vec::new());
+        }
+    }
+
+    contexts
+}
+
+fn append_document_context(
+    compile_prefix: &mut String,
+    segments: &mut Vec<SyncTexLineSegment>,
+    context: &[DocumentContextSnippet],
+) {
+    for snippet in context {
+        let temp_start_line = logical_line_count(compile_prefix) + 1;
+        compile_prefix.push_str(&snippet.content);
+        if !snippet.content.ends_with('\n') {
+            compile_prefix.push('\n');
+        }
+
+        let line_count = logical_line_count(&snippet.content);
+        if line_count > 0 {
+            segments.push(SyncTexLineSegment {
+                temp_start_line,
+                line_count,
+                source_start_line: snippet.source_start_line,
+            });
+        }
+    }
+}
+
 fn frame_contains_table_of_contents(frame: &str) -> bool {
     TOC_REGEX.is_match(&strip_tex_comments(frame))
+}
+
+fn frame_contains_title_page(frame: &str) -> bool {
+    TITLE_PAGE_REGEX.is_match(&strip_tex_comments(frame))
+}
+
+fn frame_labels(frames: &[String]) -> Vec<FrameLabel> {
+    let mut next_number = 1usize;
+    let mut front_matter_open = true;
+    let mut toc_seen = false;
+
+    frames
+        .iter()
+        .map(|frame| {
+            if front_matter_open && frame_contains_title_page(frame) {
+                FrameLabel::Title
+            } else if front_matter_open && !toc_seen && frame_contains_table_of_contents(frame) {
+                toc_seen = true;
+                front_matter_open = false;
+                FrameLabel::Toc
+            } else {
+                front_matter_open = false;
+                let label = FrameLabel::Number(next_number);
+                next_number += 1;
+                label
+            }
+        })
+        .collect()
 }
 
 fn table_of_contents_uses_dynamic_section_context(frame: &str) -> bool {
@@ -785,7 +1178,8 @@ fn toc_frame_patch(
         return TocFrameSupport::UnsupportedDynamic;
     }
 
-    let source_toc_path = input_dir.join(Path::new(tex_input_name(input_path)).with_extension("toc"));
+    let source_toc_path =
+        input_dir.join(Path::new(tex_input_name(input_path)).with_extension("toc"));
     let mut additional_dependencies = Vec::new();
     let toc_content = match fs::read_to_string(&source_toc_path) {
         Ok(content) => {
@@ -826,11 +1220,7 @@ fn dedupe_paths(paths: &mut Vec<PathBuf>) {
     paths.retain(|path| seen.insert(path.clone()));
 }
 
-fn collect_graphics_paths(
-    tex: &str,
-    base_dir: &Path,
-    inherited_paths: &[PathBuf],
-) -> Vec<PathBuf> {
+fn collect_graphics_paths(tex: &str, base_dir: &Path, inherited_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut search_paths = inherited_paths.to_vec();
     if !search_paths.iter().any(|path| path == base_dir) {
         search_paths.push(base_dir.to_path_buf());
@@ -967,7 +1357,8 @@ fn collect_related_files_from_tex(
             continue;
         }
 
-        let Some(resolved) = resolve_related_file(command, raw_path, base_dir, &graphics_paths) else {
+        let Some(resolved) = resolve_related_file(command, raw_path, base_dir, &graphics_paths)
+        else {
             continue;
         };
         if seen_paths.insert(resolved.clone()) {
@@ -1092,7 +1483,11 @@ fn write_dependency_manifest(
 fn update_dependency_manifest(cache_subdir: &Path, temp_file_name: &str) -> Result<()> {
     let fls_path = cache_subdir.join(Path::new(temp_file_name).with_extension("fls"));
     let content = fs::read_to_string(&fls_path).map_err(|err| {
-        error!("Failed to read recorder file {}: {}", fls_path.display(), err);
+        error!(
+            "Failed to read recorder file {}: {}",
+            fls_path.display(),
+            err
+        );
         FasterBeamerError::IoError
     })?;
     let dependencies = parse_fls_dependencies(&content, cache_subdir);
@@ -1104,11 +1499,39 @@ fn dependencies_for_document(cache_subdir: &Path, document: &GeneratedDocument) 
         .unwrap_or_else(|| document.dependencies.clone())
 }
 
+fn validate_compiled_pdf(compiled_pdf: &Path) -> std::io::Result<()> {
+    let content = fs::read(compiled_pdf)?;
+    if !content.starts_with(b"%PDF-") {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "PDF header is missing",
+        ));
+    }
+
+    let tail_start = content.len().saturating_sub(2048);
+    if !content[tail_start..]
+        .windows(b"%%EOF".len())
+        .any(|window| window == b"%%EOF")
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "PDF trailer is missing",
+        ));
+    }
+
+    Ok(())
+}
+
 fn compiled_output_is_fresh(compiled_pdf: &Path, dependencies: &[PathBuf]) -> bool {
-    let compiled_modified = match std::fs::metadata(compiled_pdf).and_then(|metadata| metadata.modified()) {
-        Ok(modified) => modified,
-        Err(_) => return false,
-    };
+    if validate_compiled_pdf(compiled_pdf).is_err() {
+        return false;
+    }
+
+    let compiled_modified =
+        match std::fs::metadata(compiled_pdf).and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(_) => return false,
+        };
 
     dependencies.iter().all(|dependency| {
         std::fs::metadata(dependency)
@@ -1165,11 +1588,15 @@ fn bibliography_label(bibliography: Option<BibliographyTool>) -> &'static str {
     }
 }
 
-fn first_changed_frame_label(first_changed_frame: usize, frame_count: usize) -> String {
-    if frame_count == 0 || first_changed_frame >= frame_count {
+fn first_changed_frame_label(
+    first_changed_frame: usize,
+    frame_labels: &[FrameLabel],
+    numbered_frame_count: usize,
+) -> String {
+    if frame_labels.is_empty() || first_changed_frame >= frame_labels.len() {
         String::from("none")
     } else {
-        format!("{}/{}", first_changed_frame + 1, frame_count)
+        frame_label_for_index(frame_labels, first_changed_frame, numbered_frame_count)
     }
 }
 
@@ -1312,12 +1739,12 @@ fn build_united_document(
 
     let mut search_cursor = 0usize;
     for (frame_pdf, source_frame_start_line) in frame_path_segments {
-        let path_offset = united_tex[search_cursor..].find(&frame_pdf).ok_or_else(|| {
-            error!(
-                "Failed to locate included PDF path while building united SyncTeX mapping."
-            );
-            FasterBeamerError::CompileError
-        })?;
+        let path_offset = united_tex[search_cursor..]
+            .find(&frame_pdf)
+            .ok_or_else(|| {
+                error!("Failed to locate included PDF path while building united SyncTeX mapping.");
+                FasterBeamerError::CompileError
+            })?;
         let path_idx = search_cursor + path_offset;
         segments.push(SyncTexLineSegment {
             temp_start_line: line_number_at(&united_tex, path_idx),
@@ -1428,7 +1855,26 @@ fn tex_input_name(path: &Path) -> &str {
 }
 
 fn default_output_file(input_path: &Path) -> String {
-    input_path.with_extension("pdf").to_string_lossy().into_owned()
+    input_path
+        .with_extension("pdf")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn has_tex_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("tex"))
+        .unwrap_or(false)
+}
+
+pub fn resolve_input_file(input_file: &str) -> PathBuf {
+    let input_path = PathBuf::from(input_file);
+    if input_path.is_file() || has_tex_extension(&input_path) {
+        input_path
+    } else {
+        PathBuf::from(format!("{}.tex", input_file))
+    }
 }
 
 fn frame_temp_file_name(hash: &md5::Digest) -> String {
@@ -1469,15 +1915,54 @@ fn compiled_pdf_path(cache_subdir: &Path, temp_file_name: &str) -> PathBuf {
     cache_subdir.join(Path::new(temp_file_name).with_extension("pdf"))
 }
 
-fn current_cache_paths(input_file: &str) -> (PathBuf, PathBuf, PathBuf) {
+fn remove_file_if_exists_with_retries(path: &Path) -> std::io::Result<()> {
+    const REMOVE_ATTEMPTS: usize = 5;
+    const REMOVE_RETRY_DELAY_MS: u64 = 25;
+
+    for attempt in 1..=REMOVE_ATTEMPTS {
+        match fs::remove_file(path) {
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) if attempt < REMOVE_ATTEMPTS && is_transient_file_lock(&err) => {
+                std::thread::sleep(std::time::Duration::from_millis(REMOVE_RETRY_DELAY_MS));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+fn is_transient_file_lock(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(32) || matches!(err.kind(), ErrorKind::PermissionDenied)
+}
+
+fn remove_frame_job_sidecars(cache_subdir: &Path, temp_file_name: &str) -> std::io::Result<()> {
+    let mut first_error = None;
+
+    for extension in FRAME_JOB_SIDECAR_EXTENSIONS {
+        let path = cache_subdir.join(Path::new(temp_file_name).with_extension(extension));
+        if let Err(err) = remove_file_if_exists_with_retries(&path) {
+            first_error.get_or_insert(err);
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn current_cache_paths(input_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let cwd = current_dir().unwrap();
-    let input_path = Path::new(input_file);
     let input_dir = input_path
         .parent()
         .unwrap_or(&cwd)
         .canonicalize()
         .unwrap_or_else(|_| cwd.to_owned());
-    let cachedir = dirs::cache_dir().expect("This OS is not supported").join("faster-beamer");
+    let cachedir = dirs::cache_dir()
+        .expect("This OS is not supported")
+        .join("faster-beamer");
     let cache_subdir = cache_path(&cachedir, &input_dir);
 
     (input_dir, cachedir, cache_subdir)
@@ -1494,7 +1979,9 @@ fn is_legacy_frame_temp_file(path: &Path, file_name: &str) -> bool {
     }
 
     std::fs::read_to_string(path)
-        .map(|content| content.contains("\\addtocounter{framenumber}") && content.contains("\\end{document}"))
+        .map(|content| {
+            content.contains("\\addtocounter{framenumber}") && content.contains("\\end{document}")
+        })
         .unwrap_or(false)
 }
 
@@ -1504,7 +1991,9 @@ fn is_legacy_preamble_temp_file(file_name: &str) -> bool {
             let mut parts = stem.rsplitn(2, '_');
             let draft_flag = parts.next();
             let digest = parts.next();
-            if matches!(draft_flag, Some("true") | Some("false")) && digest.map(is_hex_digest).unwrap_or(false) {
+            if matches!(draft_flag, Some("true") | Some("false"))
+                && digest.map(is_hex_digest).unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -1516,13 +2005,21 @@ fn is_legacy_preamble_temp_file(file_name: &str) -> bool {
 fn clean_prefixed_files(input_dir: &Path) -> Result<usize> {
     let mut removed = 0;
     let entries = std::fs::read_dir(input_dir).map_err(|err| {
-        error!("Failed to read input directory {}: {}", input_dir.display(), err);
+        error!(
+            "Failed to read input directory {}: {}",
+            input_dir.display(),
+            err
+        );
         FasterBeamerError::IoError
     })?;
 
     for entry in entries {
         let entry = entry.map_err(|err| {
-            error!("Failed to inspect input directory {}: {}", input_dir.display(), err);
+            error!(
+                "Failed to inspect input directory {}: {}",
+                input_dir.display(),
+                err
+            );
             FasterBeamerError::IoError
         })?;
         let path = entry.path();
@@ -1542,7 +2039,11 @@ fn clean_prefixed_files(input_dir: &Path) -> Result<usize> {
             || is_legacy_preamble_temp_file(file_name)
         {
             std::fs::remove_file(&path).map_err(|err| {
-                error!("Failed to remove temporary file {}: {}", path.display(), err);
+                error!(
+                    "Failed to remove temporary file {}: {}",
+                    path.display(),
+                    err
+                );
                 FasterBeamerError::IoError
             })?;
             removed += 1;
@@ -1563,27 +2064,147 @@ fn prune_empty_cache_dirs(cache_dir: &Path, cache_subdir: &Path) {
             Ok(_) => current = dir.parent(),
             Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => break,
             Err(err) => {
-                warn!("Failed to prune empty cache directory {}: {}", dir.display(), err);
+                warn!(
+                    "Failed to prune empty cache directory {}: {}",
+                    dir.display(),
+                    err
+                );
                 break;
             }
         }
     }
 }
 
+fn cache_garbage_cutoff() -> SystemTime {
+    SystemTime::now() - Duration::from_secs(CACHE_GARBAGE_RETENTION_DAYS * 24 * 60 * 60)
+}
+
+fn cache_sweep_is_due(cache_dir: &Path) -> bool {
+    let stamp_path = cache_dir.join(CACHE_GARBAGE_SWEEP_STAMP);
+    let interval = Duration::from_secs(CACHE_GARBAGE_SWEEP_INTERVAL_HOURS * 60 * 60);
+
+    match fs::metadata(&stamp_path).and_then(|metadata| metadata.modified()) {
+        Ok(modified) => modified
+            .elapsed()
+            .map(|elapsed| elapsed >= interval)
+            .unwrap_or(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => true,
+        Err(err) => {
+            warn!(
+                "Failed to inspect cache cleanup stamp {}: {}",
+                stamp_path.display(),
+                err
+            );
+            true
+        }
+    }
+}
+
+fn mark_cache_sweep(cache_dir: &Path) {
+    let stamp_path = cache_dir.join(CACHE_GARBAGE_SWEEP_STAMP);
+    if let Err(err) = fs::write(&stamp_path, b"") {
+        warn!(
+            "Failed to update cache cleanup stamp {}: {}",
+            stamp_path.display(),
+            err
+        );
+    }
+}
+
+fn path_is_inside(path: &Path, parent: &Path) -> bool {
+    path == parent || path.starts_with(parent)
+}
+
+fn cache_entry_is_stale(path: &Path, cutoff: SystemTime) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(|modified| modified < cutoff)
+        .unwrap_or(false)
+}
+
+fn remove_stale_cache_entries(
+    dir: &Path,
+    active_cache_subdir: &Path,
+    cutoff: SystemTime,
+) -> std::io::Result<usize> {
+    let mut removed = 0;
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if path_is_inside(&path, active_cache_subdir) {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            removed += remove_stale_cache_entries(&path, active_cache_subdir, cutoff)?;
+            match fs::remove_dir(&path) {
+                Ok(_) => removed += 1,
+                Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(
+                        "Failed to prune cache directory {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        } else if file_type.is_file() && cache_entry_is_stale(&path, cutoff) {
+            match remove_file_if_exists_with_retries(&path) {
+                Ok(_) => removed += 1,
+                Err(err) => warn!(
+                    "Failed to remove stale cache file {}: {}",
+                    path.display(),
+                    err
+                ),
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+fn remove_cache_garbage(cache_dir: &Path, active_cache_subdir: &Path) {
+    if !cache_dir.is_dir() || !cache_sweep_is_due(cache_dir) {
+        return;
+    }
+
+    match remove_stale_cache_entries(cache_dir, active_cache_subdir, cache_garbage_cutoff()) {
+        Ok(removed) => {
+            if removed > 0 {
+                info!(
+                    "Cache cleanup: removed {} stale entries from {}.",
+                    removed,
+                    cache_dir.display()
+                );
+            }
+            mark_cache_sweep(cache_dir);
+        }
+        Err(err) => warn!("Cache cleanup failed for {}: {}", cache_dir.display(), err),
+    }
+}
+
 pub fn clean_generated_artifacts(input_file: &str, args: &ArgMatches) -> Result<()> {
-    let input_path = Path::new(input_file);
+    let input_path = resolve_input_file(input_file);
     if !input_path.is_file() {
-        error!("Could not open {}", input_file);
+        error!("Could not open {}", input_path.display());
         return Err(FasterBeamerError::InputFileNotExistent);
     }
 
-    let (input_dir, cachedir, cache_subdir) = current_cache_paths(input_file);
-    let output_file = output_file_arg(args, input_path);
+    let (input_dir, cachedir, cache_subdir) = current_cache_paths(&input_path);
+    let output_file = output_file_arg(args, &input_path);
     let removed_input_files = clean_prefixed_files(&input_dir)?;
 
     if cache_subdir.is_dir() {
         std::fs::remove_dir_all(&cache_subdir).map_err(|err| {
-            error!("Failed to remove cache directory {}: {}", cache_subdir.display(), err);
+            error!(
+                "Failed to remove cache directory {}: {}",
+                cache_subdir.display(),
+                err
+            );
             FasterBeamerError::IoError
         })?;
         prune_empty_cache_dirs(&cachedir, &cache_subdir);
@@ -1592,8 +2213,7 @@ pub fn clean_generated_artifacts(input_file: &str, args: &ArgMatches) -> Result<
     clear_published_synctex(&output_file);
     info!(
         "Removed faster-beamer artifacts for {} ({} stale source temp files).",
-        input_file,
-        removed_input_files
+        input_file, removed_input_files
     );
 
     Ok(())
@@ -1647,7 +2267,10 @@ fn effective_parallel_job_count(
     })
 }
 
-fn apply_compiler_options(mut compiler: LatexCompiler, compiler_options: &[String]) -> LatexCompiler {
+fn apply_compiler_options(
+    mut compiler: LatexCompiler,
+    compiler_options: &[String],
+) -> LatexCompiler {
     for option in compiler_options {
         compiler = compiler.add_arg(option);
     }
@@ -1671,7 +2294,10 @@ fn latex_pass_count(args: &ArgMatches) -> usize {
     }
 }
 
-fn latex_run_options(latex_pass_count: usize, bibliography: Option<BibliographyTool>) -> LatexRunOptions {
+fn latex_run_options(
+    latex_pass_count: usize,
+    bibliography: Option<BibliographyTool>,
+) -> LatexRunOptions {
     LatexRunOptions::new()
         .with_latex_pass_count(latex_pass_count)
         .with_bibliography_tool(bibliography)
@@ -1680,12 +2306,12 @@ fn latex_run_options(latex_pass_count: usize, bibliography: Option<BibliographyT
 pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let total_start_time = std::time::Instant::now();
     let mut step_start_time = total_start_time;
-    let input_path = Path::new(&input_file);
-    let (input_dir, cachedir, cache_subdir) = current_cache_paths(input_file);
+    let input_path = resolve_input_file(input_file);
+    let (input_dir, cachedir, cache_subdir) = current_cache_paths(&input_path);
     let original_source_path = input_path
         .canonicalize()
-        .unwrap_or_else(|_| input_dir.join(tex_input_name(input_path)));
-    let output_file = output_file_arg(args, input_path);
+        .unwrap_or_else(|_| input_dir.join(tex_input_name(&input_path)));
+    let output_file = output_file_arg(args, &input_path);
     let correct_frame_numbers = args.is_present("frame-numbers");
     let latex_pass_count = latex_pass_count(args);
     let bibliography = bibliography_tool(args);
@@ -1708,7 +2334,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let build_mode = build_mode_label(args);
 
     if !input_path.is_file() {
-        error!("Could not open {}", input_file);
+        error!("Could not open {}", input_path.display());
         return Err(FasterBeamerError::InputFileNotExistent);
     }
     if lualatex_auto_parallel_capped {
@@ -1717,8 +2343,9 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             LUALATEX_AUTO_PARALLEL_JOBS
         );
     }
+    remove_cache_garbage(&cachedir, &cache_subdir);
 
-    let parsed_file = parsing::ParsedFile::new(input_file.to_string());
+    let parsed_file = parsing::ParsedFile::new(input_path.to_string_lossy().into_owned());
     trace!("{}", parsed_file.syntax_tree.root_node().to_sexp());
 
     let frame_nodes = if args.is_present("tree-sitter") {
@@ -1729,6 +2356,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
     let mut frames = Vec::with_capacity(frame_nodes.len());
     let mut frame_source_lines = Vec::with_capacity(frame_nodes.len());
+    let mut frame_source_ranges = Vec::with_capacity(frame_nodes.len());
     if !frame_nodes.is_empty() {
         for f in frame_nodes.iter() {
             let node_string = parsed_file.get_node_string(&f);
@@ -1737,6 +2365,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 line_number_at(&parsed_file.file_content, f.start_byte()),
                 logical_line_count(node_string),
             ));
+            frame_source_ranges.push((f.start_byte(), f.end_byte()));
         }
     } else {
         for cap in FRAME_REGEX.captures_iter(&parsed_file.file_content) {
@@ -1748,8 +2377,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 line_number_at(&parsed_file.file_content, frame_match.start()),
                 logical_line_count(frame_match.as_str()),
             ));
+            frame_source_ranges.push((frame_match.start(), frame_match.end()));
         }
     }
+    let frame_labels = frame_labels(&frames);
+    let numbered_frame_count = numbered_frame_count(&frame_labels);
     info!(
         "Build: {} -> {} [{}]",
         original_source_path.display(),
@@ -1757,9 +2389,14 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         build_mode
     );
     info!(
-        "Frames: total={}, parser={} ({} ms)",
+        "Frames: total={}, numbered={}, parser={} ({} ms)",
         frames.len(),
-        if !frame_nodes.is_empty() { "tree-sitter" } else { "regex" },
+        numbered_frame_count,
+        if !frame_nodes.is_empty() {
+            "tree-sitter"
+        } else {
+            "regex"
+        },
         step_start_time.elapsed().as_millis()
     );
     step_start_time = std::time::Instant::now();
@@ -1805,7 +2442,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     .unwrap_or_else(|| r"\documentclass[aspectratio=43,c,xcolor=dvipsnames]{beamer}".to_string());
 
     std::fs::create_dir_all(&cachedir).map_err(|ref err| {
-        error!("Failed to create cache dir \"{}\": {}", cachedir.display(), err);
+        error!(
+            "Failed to create cache dir \"{}\": {}",
+            cachedir.display(),
+            err
+        );
         FasterBeamerError::IoError
     })?;
 
@@ -1835,6 +2476,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         .rfind("\\end{document}")
         .map(|idx| line_number_at(&parsed_file.file_content, idx))
         .unwrap_or(document_begin_line);
+    let document_contexts =
+        document_contexts_before_frames(&parsed_file.file_content, &frame_source_ranges, find);
     let preamble_filename = preamble_job_name(&preamble_hash);
     let preamble_format_path = input_dir.join(format!("{}.fmt", preamble_filename));
     if !precompile_preamble {
@@ -1844,9 +2487,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             step_start_time.elapsed().as_millis()
         );
         step_start_time = std::time::Instant::now();
-    } else if preamble_format_path.is_file() && !force_recompile
-    {
-        info!("Preamble: cached {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
+    } else if preamble_format_path.is_file() && !force_recompile {
+        info!(
+            "Preamble: cached {} ({} ms)",
+            preamble_format_path.display(),
+            step_start_time.elapsed().as_millis()
+        );
         step_start_time = std::time::Instant::now();
     } else {
         info!("Preamble: compiling {}", preamble_format_path.display());
@@ -1865,7 +2511,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         for option in &compiler_options {
             command.arg(option);
         }
-        let output = command.arg(tex_input_name(input_path)).current_dir(&input_dir).output();
+        let output = command
+            .arg(tex_input_name(&input_path))
+            .current_dir(&input_dir)
+            .output();
         match output {
             Err(e) => {
                 let preamble_log_path = input_dir.join(format!("{}.log", preamble_filename));
@@ -1903,7 +2552,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         "Preamble: lualatex reported a PDF backend error after dumping {}; using the generated format.",
                         preamble_format_path.display()
                     );
-                    info!("Preamble: compiled {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
+                    info!(
+                        "Preamble: compiled {} ({} ms)",
+                        preamble_format_path.display(),
+                        step_start_time.elapsed().as_millis()
+                    );
                     step_start_time = std::time::Instant::now();
                 } else {
                     let stderr = str::from_utf8(&output.stderr).unwrap_or("").trim();
@@ -1941,7 +2594,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 }
             }
             _ => {
-                info!("Preamble: compiled {} ({} ms)", preamble_format_path.display(), step_start_time.elapsed().as_millis());
+                info!(
+                    "Preamble: compiled {} ({} ms)",
+                    preamble_format_path.display(),
+                    step_start_time.elapsed().as_millis()
+                );
                 step_start_time = std::time::Instant::now();
             }
         };
@@ -1951,9 +2608,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     let mut generated_documents = Vec::new();
     let mut unsupported_dynamic_toc_frames = 0usize;
     let mut command = Command::new("pdfunite");
-    for (frame_idx, (f, (source_frame_start_line, frame_line_count))) in frames
+    for (frame_idx, ((f, (source_frame_start_line, frame_line_count)), document_context)) in frames
         .iter()
         .zip(frame_source_lines.iter())
+        .zip(document_contexts.iter())
         .enumerate()
     {
         let format_line = if precompile_preamble {
@@ -1961,13 +2619,14 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         } else {
             String::new()
         };
-        let counter_setup = frame_counter_setup(frame_idx, correct_frame_numbers);
+        let counter_setup = frame_counter_setup(&frame_labels[frame_idx], correct_frame_numbers);
+        let number_display_setup = frame_number_display_setup(&frame_labels[frame_idx]);
         let toc_frame_patch = toc_frame_patch(
             f,
             *source_frame_start_line,
             document_begin_line,
             &input_dir,
-            input_path,
+            &input_path,
             &source_sections,
         );
         let (toc_runtime_setup, support_files, additional_dependencies) = match toc_frame_patch {
@@ -1982,11 +2641,12 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 (String::new(), Vec::new(), Vec::new())
             }
         };
-        let compile_prefix = format_line.clone()
-            + &preamble
-            + "\n\\begin{document}\n"
-            + &counter_setup
-            + &toc_runtime_setup;
+        let mut compile_prefix = format_line.clone() + &preamble + "\n\\begin{document}\n";
+        let mut context_segments = Vec::new();
+        append_document_context(&mut compile_prefix, &mut context_segments, document_context);
+        compile_prefix.push_str(&counter_setup);
+        compile_prefix.push_str(number_display_setup);
+        compile_prefix.push_str(&toc_runtime_setup);
         let compile_string = compile_prefix.clone() + &f + "\n\\end{document}\n";
 
         let mut hash_input = compile_string.clone();
@@ -2007,7 +2667,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         let temp_file_name = frame_temp_file_name(&hash);
         let output = compiled_pdf_path(&cache_subdir, &temp_file_name);
         let temp_frame_start_line = logical_line_count(&compile_prefix) + 1;
-        let temp_document_begin_line = logical_line_count(&(format_line.clone() + &preamble + "\n")) + 1;
+        let temp_document_begin_line =
+            logical_line_count(&(format_line.clone() + &preamble + "\n")) + 1;
         let temp_document_end_line = logical_line_count(&(compile_prefix.clone() + &f + "\n")) + 1;
         let mut segments = Vec::new();
 
@@ -2023,6 +2684,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             line_count: 1,
             source_start_line: document_begin_line,
         });
+        segments.extend(context_segments);
         segments.push(SyncTexLineSegment {
             temp_start_line: temp_frame_start_line,
             line_count: *frame_line_count,
@@ -2057,9 +2719,9 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             "Detected {} dynamic Beamer TOC frame(s) that faster-beamer cannot render correctly as cached per-frame PDFs (for example \\AtBeginSection with \\tableofcontents[currentsection]). The build will continue, but the proper workflow is a full document compile such as: {} -interaction=nonstopmode -halt-on-error {} ; {} -interaction=nonstopmode -halt-on-error {} (and run bibtex/biber between passes if needed).",
             unsupported_dynamic_toc_frames,
             selected_engine.command_name(),
-            tex_input_name(input_path),
+            tex_input_name(&input_path),
             selected_engine.command_name(),
-            tex_input_name(input_path),
+            tex_input_name(&input_path),
         );
     }
 
@@ -2091,13 +2753,16 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
         let compiled_pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
         let dependencies = dependencies_for_document(&cache_subdir, document);
-        let needs_compile = force_recompile
-            || !compiled_output_is_fresh(&compiled_pdf, &dependencies);
+        let needs_compile =
+            force_recompile || !compiled_output_is_fresh(&compiled_pdf, &dependencies);
 
         if needs_compile {
             compile_targets.push((frame_idx, document, needs_compile));
         } else {
-            trace!("{} is already compiled!", compiled_pdf.to_str().unwrap_or("???"));
+            trace!(
+                "{} is already compiled!",
+                compiled_pdf.to_str().unwrap_or("???")
+            );
             cached_frames += 1;
         }
     }
@@ -2114,7 +2779,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         compile_job_count,
         frames_to_compile,
         cached_frames,
-        first_changed_frame_label(first_changed_frame, frames.len())
+        first_changed_frame_label(first_changed_frame, &frame_labels, numbered_frame_count)
     );
     info!(
         "LaTeX: engine={}, passes={}, bibliography={}, precompile-preamble={}, parallel={} ({} ms)",
@@ -2127,11 +2792,13 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     );
     step_start_time = std::time::Instant::now();
 
-    let frame_map: std::sync::Arc<std::sync::Mutex<Vec<(char, usize)>>> = std::sync::Arc::new(
-        std::sync::Mutex::new(
-            compile_targets.iter().map(|(fi, _, _)| ('.', fi + 1)).collect()
-        )
-    );
+    let frame_map: std::sync::Arc<std::sync::Mutex<Vec<(char, FrameLabel)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(
+            compile_targets
+                .iter()
+                .map(|(fi, _, _)| ('.', frame_labels[*fi].clone()))
+                .collect(),
+        ));
     let progress_bar = compile_progress_bar(compile_targets.len());
     let latex_input = LatexInput::new();
     let compile_failures: Mutex<Vec<FrameCompileFailure>> = Mutex::new(Vec::new());
@@ -2144,6 +2811,15 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             let mut support_paths = Vec::new();
 
             if write(&temp_file, &document.tex_content).is_ok() {
+                if let Err(err) =
+                    remove_frame_job_sidecars(&cache_subdir, &document.sync_map.temp_file_name)
+                {
+                    warn!(
+                        "Failed to remove stale frame sidecar files for {}: {}",
+                        document.sync_map.temp_file_name, err
+                    );
+                }
+
                 for support_file in &document.support_files {
                     let support_path = cache_subdir.join(
                         Path::new(&document.sync_map.temp_file_name)
@@ -2180,18 +2856,35 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     &latex_input,
                     document_run_options,
                 );
-                if result.is_ok() {
-                    if update_dependency_manifest(&cache_subdir, &document.sync_map.temp_file_name).is_err() {
+                let compile_error = match result {
+                    Ok(compiled_pdf) => validate_compiled_pdf(&compiled_pdf).err().map(|err| {
+                        format!(
+                            "Generated PDF {} is incomplete or unreadable: {}",
+                            compiled_pdf.display(),
+                            err
+                        )
+                    }),
+                    Err(err) => Some(format!("{}", err)),
+                };
+
+                if compile_error.is_none() {
+                    if update_dependency_manifest(&cache_subdir, &document.sync_map.temp_file_name)
+                        .is_err()
+                    {
                         warn!(
                             "Failed to update dependency manifest for {}",
                             document.sync_map.temp_file_name
                         );
                     }
-                    if let Err(err) = std::fs::remove_file(&temp_file) {
-                        warn!("Failed to remove temporary frame source {}: {}", temp_file.display(), err);
+                    if let Err(err) = remove_file_if_exists_with_retries(&temp_file) {
+                        warn!(
+                            "Failed to remove temporary frame source {}: {}",
+                            temp_file.display(),
+                            err
+                        );
                     }
                     for support_path in &support_paths {
-                        if let Err(err) = std::fs::remove_file(support_path) {
+                        if let Err(err) = remove_file_if_exists_with_retries(support_path) {
                             warn!(
                                 "Failed to remove temporary support file {}: {}",
                                 support_path.display(),
@@ -2202,9 +2895,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                     trace!("Compiled file {}", &temp_file.to_str().unwrap());
                     None
                 } else {
-                    let compile_error = result.err().unwrap();
                     for support_path in &support_paths {
-                        if let Err(err) = std::fs::remove_file(support_path) {
+                        if let Err(err) = remove_file_if_exists_with_retries(support_path) {
                             warn!(
                                 "Failed to remove temporary support file {}: {}",
                                 support_path.display(),
@@ -2220,7 +2912,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                         temp_file_name: document.sync_map.temp_file_name.clone(),
                         sync_segments: document.sync_map.segments.clone(),
                         frame_preview,
-                        error: format!("{}", compile_error),
+                        error: compile_error.unwrap(),
                     })
                 }
             } else {
@@ -2237,14 +2929,15 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             }
         };
 
-    let set_compile_job_state = |frame_map: &std::sync::Arc<std::sync::Mutex<Vec<(char, usize)>>>,
-                                 progress_bar: &ProgressBar,
-                                 job_idx: usize,
-                                 state: char| {
-        let mut map = frame_map.lock().unwrap();
-        map[job_idx].0 = state;
-        progress_bar.set_message(render_frame_map(&map));
-    };
+    let set_compile_job_state =
+        |frame_map: &std::sync::Arc<std::sync::Mutex<Vec<(char, FrameLabel)>>>,
+         progress_bar: &ProgressBar,
+         job_idx: usize,
+         state: char| {
+            let mut map = frame_map.lock().unwrap();
+            map[job_idx].0 = state;
+            progress_bar.set_message(render_frame_map(&map));
+        };
 
     let compile_document = |job_idx: usize, frame_idx: usize, document: &GeneratedDocument| {
         set_compile_job_state(&frame_map, &progress_bar, job_idx, 'R');
@@ -2271,20 +2964,18 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 .build()
                 .expect("Failed to build the compile thread pool")
                 .install(|| {
-                    compile_targets
-                        .par_iter()
-                        .enumerate()
-                        .for_each(|(job_idx, (frame_idx, document, _))| {
+                    compile_targets.par_iter().enumerate().for_each(
+                        |(job_idx, (frame_idx, document, _))| {
                             compile_document(job_idx, *frame_idx, document)
-                        });
+                        },
+                    );
                 });
         } else {
-            compile_targets
-                .par_iter()
-                .enumerate()
-                .for_each(|(job_idx, (frame_idx, document, _))| {
+            compile_targets.par_iter().enumerate().for_each(
+                |(job_idx, (frame_idx, document, _))| {
                     compile_document(job_idx, *frame_idx, document)
-                });
+                },
+            );
         }
     } else {
         compile_targets
@@ -2295,7 +2986,10 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             });
     }
     progress_bar.finish_and_clear();
-    info!("Frames compiled ({} ms)", step_start_time.elapsed().as_millis());
+    info!(
+        "Frames compiled ({} ms)",
+        step_start_time.elapsed().as_millis()
+    );
     step_start_time = std::time::Instant::now();
 
     let mut failed_compiles = compile_failures
@@ -2311,11 +3005,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             retry_frame_indices.len()
         );
 
-        let retry_frame_map: std::sync::Arc<std::sync::Mutex<Vec<(char, usize)>>> =
+        let retry_frame_map: std::sync::Arc<std::sync::Mutex<Vec<(char, FrameLabel)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(
                 retry_frame_indices
                     .iter()
-                    .map(|frame_idx| ('.', frame_idx + 1))
+                    .map(|frame_idx| ('.', frame_labels[*frame_idx].clone()))
                     .collect(),
             ));
         let retry_progress_bar = compile_progress_bar(retry_frame_indices.len());
@@ -2356,7 +3050,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             &failed_compiles,
             &cache_subdir,
             &original_source_path,
-            frames.len(),
+            &frame_labels,
+            numbered_frame_count,
         ) {
             let _ = err;
             warn!(
@@ -2368,7 +3063,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             &failed_compiles,
             &original_source_path,
             &cache_subdir,
-            frames.len(),
+            &frame_labels,
+            numbered_frame_count,
         );
         show_error_slide(&cachedir, &output_file, selected_engine);
         *PREVIOUS_FRAMES.lock().unwrap() = Vec::new();
@@ -2458,7 +3154,11 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             }
         };
     } else if args.is_present("tex-unite") {
-        info!("Publish: united document -> {} ({} ms)", Path::new(&output_file).display(), step_start_time.elapsed().as_millis());
+        info!(
+            "Publish: united document -> {} ({} ms)",
+            Path::new(&output_file).display(),
+            step_start_time.elapsed().as_millis()
+        );
         step_start_time = std::time::Instant::now();
 
         match compile_united_artifacts(
@@ -2496,9 +3196,8 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         }
         if first_changed_frame < generated_documents.len() {
             info!(
-                "Publish: preview frame {}/{} -> {} ({} ms)",
-                first_changed_frame + 1,
-                generated_documents.len(),
+                "Publish: preview frame {} -> {} ({} ms)",
+                frame_label_for_index(&frame_labels, first_changed_frame, numbered_frame_count),
                 Path::new(&output_file).display(),
                 step_start_time.elapsed().as_millis()
             );
@@ -2519,18 +3218,28 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     }
 
     *PREVIOUS_FRAMES.lock().unwrap() = frames;
-    info!("Total time: {} ms (last step {} ms)", total_start_time.elapsed().as_millis(), step_start_time.elapsed().as_millis());
+    info!(
+        "Total time: {} ms (last step {} ms)",
+        total_start_time.elapsed().as_millis(),
+        step_start_time.elapsed().as_millis()
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::collect_related_files;
+    use super::document_contexts_before_frames;
     use super::document_sections;
     use super::first_changed_frame_index;
     use super::frame_counter_setup;
+    use super::frame_labels;
+    use super::frame_number_display_setup;
+    use super::numbered_frame_count;
+    use super::resolve_input_file;
     use super::toc_frame_patch;
     use super::united_frame_replacement;
+    use super::FrameLabel;
     use super::FrameSyncTexMap;
     use super::GeneratedDocument;
     use super::TocFrameSupport;
@@ -2539,14 +3248,193 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
+    fn regex_frame_ranges(source: &str) -> Vec<(usize, usize)> {
+        super::FRAME_REGEX
+            .captures_iter(source)
+            .map(|capture| {
+                let frame_match = capture.get(0).unwrap();
+                (frame_match.start(), frame_match.end())
+            })
+            .collect()
+    }
+
+    fn context_text(context: &[super::DocumentContextSnippet]) -> String {
+        context
+            .iter()
+            .map(|snippet| snippet.content.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     #[test]
-    fn frame_number_setup_only_sets_framenumber() {
-        assert_eq!(frame_counter_setup(3, true), "\\setcounter{framenumber}{3}\n");
+    fn frame_number_setup_uses_previous_numbered_frame() {
+        assert_eq!(
+            frame_counter_setup(&FrameLabel::Number(3), true),
+            "\\setcounter{framenumber}{2}\n"
+        );
+        assert_eq!(
+            frame_counter_setup(&FrameLabel::Title, true),
+            "\\setcounter{framenumber}{0}\n"
+        );
+        assert_eq!(
+            frame_counter_setup(&FrameLabel::Toc, true),
+            "\\setcounter{framenumber}{0}\n"
+        );
     }
 
     #[test]
     fn frame_number_setup_is_empty_when_disabled() {
-        assert_eq!(frame_counter_setup(3, false), "");
+        assert_eq!(frame_counter_setup(&FrameLabel::Number(3), false), "");
+    }
+
+    #[test]
+    fn toc_frame_display_setup_hides_frame_number() {
+        let setup = frame_number_display_setup(&FrameLabel::Toc);
+
+        assert!(setup.contains("\\def\\insertframenumber{}"));
+        assert!(setup.contains("\\setbeamertemplate{page number in head/foot}{}"));
+        assert!(setup.contains("\\setbeamertemplate{frame numbering}{}"));
+        assert_eq!(frame_number_display_setup(&FrameLabel::Number(1)), "");
+    }
+
+    #[test]
+    fn frame_labels_skip_front_matter_title_and_toc_frames() {
+        let labels = frame_labels(&[
+            String::from("\\begin{frame}\\titlepage\\end{frame}"),
+            String::from("\\begin{frame}{Agenda}\\tableofcontents\\end{frame}"),
+            String::from("\\begin{frame}{Body}\\end{frame}"),
+            String::from("\\sectiontitlepage{A}{B}"),
+            String::from("\\begin{frame}{More}\\end{frame}"),
+            String::from("\\begin{frame}{Roadmap}\\tableofcontents[currentsection]\\end{frame}"),
+        ]);
+
+        assert_eq!(
+            labels,
+            vec![
+                FrameLabel::Title,
+                FrameLabel::Toc,
+                FrameLabel::Number(1),
+                FrameLabel::Number(2),
+                FrameLabel::Number(3),
+                FrameLabel::Number(4)
+            ]
+        );
+        assert_eq!(numbered_frame_count(&labels), 4);
+    }
+
+    #[test]
+    fn frame_labels_start_after_title_when_toc_is_absent() {
+        let labels = frame_labels(&[
+            String::from("\\begin{frame}\\titlepage\\end{frame}"),
+            String::from("\\sectiontitlepage{Intro}{Overview}"),
+            String::from("\\begin{frame}{Body}\\end{frame}"),
+        ]);
+
+        assert_eq!(
+            labels,
+            vec![
+                FrameLabel::Title,
+                FrameLabel::Number(1),
+                FrameLabel::Number(2)
+            ]
+        );
+        assert_eq!(numbered_frame_count(&labels), 2);
+    }
+
+    #[test]
+    fn document_context_accumulates_definitions_between_frames() {
+        let source = "\\documentclass{beamer}\n\
+\\begin{document}\n\
+\\begin{frame}{A}\n\
+A\n\
+\\end{frame}\n\
+\\newcommand{\\shared}{first}\n\
+\\definecolor{brand}{RGB}{1,2,3}\n\
+\\section{Ignored}\n\
+\\begin{frame}{B}\n\
+\\shared\n\
+\\end{frame}\n\
+\\renewcommand{\\shared}{second}\n\
+\\begin{frame}{C}\n\
+\\shared\n\
+\\end{frame}\n\
+\\end{document}\n";
+
+        let contexts = document_contexts_before_frames(
+            source,
+            &regex_frame_ranges(source),
+            source.find("\\begin{document}"),
+        );
+
+        assert_eq!(context_text(&contexts[0]), "");
+
+        let second_context = context_text(&contexts[1]);
+        assert!(second_context.contains("\\newcommand{\\shared}{first}"));
+        assert!(second_context.contains("\\definecolor{brand}{RGB}{1,2,3}"));
+        assert!(!second_context.contains("\\section{Ignored}"));
+        assert_eq!(contexts[1][0].source_start_line, 6);
+
+        let third_context = context_text(&contexts[2]);
+        assert!(third_context.contains("\\newcommand{\\shared}{first}"));
+        assert!(third_context.contains("\\renewcommand{\\shared}{second}"));
+    }
+
+    #[test]
+    fn document_context_keeps_multiline_definitions_together() {
+        let source = "\\documentclass{beamer}\n\
+\\begin{document}\n\
+\\begin{frame}{A}\n\
+A\n\
+\\end{frame}\n\
+\\newcommand{\\wrapped}[1]{%\n\
+  \\textbf{#1}\n\
+}\n\
+% \\newcommand{\\commented}{ignored}\n\
+\\begin{frame}{B}\n\
+\\wrapped{B}\n\
+\\end{frame}\n\
+\\end{document}\n";
+
+        let contexts = document_contexts_before_frames(
+            source,
+            &regex_frame_ranges(source),
+            source.find("\\begin{document}"),
+        );
+        let second_context = context_text(&contexts[1]);
+
+        assert!(second_context.contains("\\newcommand{\\wrapped}[1]{%"));
+        assert!(second_context.contains("\\textbf{#1}"));
+        assert!(second_context.contains("}\n"));
+        assert!(!second_context.contains("\\commented"));
+        assert_eq!(contexts[1].len(), 1);
+        assert_eq!(contexts[1][0].source_start_line, 6);
+    }
+
+    #[test]
+    fn resolve_input_file_appends_tex_when_bare_input_is_missing() {
+        let temp_dir = tempdir().unwrap();
+        let bare_input = temp_dir.path().join("slides");
+        let tex_input = temp_dir.path().join("slides.tex");
+        fs::write(&tex_input, "\\documentclass{beamer}").unwrap();
+
+        assert_eq!(resolve_input_file(bare_input.to_str().unwrap()), tex_input);
+    }
+
+    #[test]
+    fn resolve_input_file_keeps_existing_bare_input() {
+        let temp_dir = tempdir().unwrap();
+        let bare_input = temp_dir.path().join("slides");
+        fs::write(&bare_input, "\\documentclass{beamer}").unwrap();
+
+        assert_eq!(resolve_input_file(bare_input.to_str().unwrap()), bare_input);
+    }
+
+    #[test]
+    fn resolve_input_file_keeps_explicit_tex_input() {
+        let temp_dir = tempdir().unwrap();
+        let tex_input = temp_dir.path().join("slides.tex");
+
+        assert_eq!(resolve_input_file(tex_input.to_str().unwrap()), tex_input);
     }
 
     #[test]
@@ -2602,10 +3490,8 @@ mod tests {
         fs::write(&shared_path, "\\includegraphics{plot}").unwrap();
         fs::write(&graphic_path, b"pdf").unwrap();
 
-        let dependencies = collect_related_files(
-            "\\graphicspath{{./figs/}}\\input{shared}",
-            temp_dir.path(),
-        );
+        let dependencies =
+            collect_related_files("\\graphicspath{{./figs/}}\\input{shared}", temp_dir.path());
 
         assert!(dependencies.contains(&shared_path));
         assert!(dependencies.contains(&graphic_path));
@@ -2625,8 +3511,12 @@ mod tests {
             TocFrameSupport::Supported(patch) => {
                 assert!(patch.runtime_setup.contains("\\setcounter{section}{0}"));
                 assert_eq!(patch.support_files.len(), 1);
-                assert!(patch.support_files[0].content.contains("\\beamer@sectionintoc {1}{Intro}"));
-                assert!(patch.support_files[0].content.contains("\\beamer@sectionintoc {2}{Next}"));
+                assert!(patch.support_files[0]
+                    .content
+                    .contains("\\beamer@sectionintoc {1}{Intro}"));
+                assert!(patch.support_files[0]
+                    .content
+                    .contains("\\beamer@sectionintoc {2}{Next}"));
             }
             _ => panic!("expected supported TOC frame patch"),
         }
@@ -2679,6 +3569,69 @@ mod tests {
     }
 
     #[test]
+    fn remove_frame_job_sidecars_clears_stale_auxiliary_files() {
+        let temp_dir = tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+        let temp_file_name = "faster-beamer-temp-test.tex";
+        let aux_path = cache_dir.join("faster-beamer-temp-test.aux");
+        let toc_path = cache_dir.join("faster-beamer-temp-test.toc");
+        let synctex_path = cache_dir.join("faster-beamer-temp-test.synctex.gz");
+        let pdf_path = cache_dir.join("faster-beamer-temp-test.pdf");
+        let deps_path = cache_dir.join("faster-beamer-temp-test.deps");
+
+        fs::write(&aux_path, b"\0\0\0").unwrap();
+        fs::write(&toc_path, "toc").unwrap();
+        fs::write(&synctex_path, "synctex").unwrap();
+        fs::write(&pdf_path, "pdf").unwrap();
+        fs::write(&deps_path, "deps").unwrap();
+
+        super::remove_frame_job_sidecars(cache_dir, temp_file_name).unwrap();
+
+        assert!(!aux_path.exists());
+        assert!(!toc_path.exists());
+        assert!(!synctex_path.exists());
+        assert!(pdf_path.exists());
+        assert!(deps_path.exists());
+    }
+
+    #[test]
+    fn stale_cache_cleanup_preserves_active_cache_subdir() {
+        let temp_dir = tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("faster-beamer");
+        let active_cache = cache_dir.join("active").join("deck");
+        let stale_cache = cache_dir.join("old").join("deck");
+        let active_pdf = active_cache.join("frame.pdf");
+        let stale_pdf = stale_cache.join("frame.pdf");
+
+        fs::create_dir_all(&active_cache).unwrap();
+        fs::create_dir_all(&stale_cache).unwrap();
+        fs::write(&active_pdf, b"active").unwrap();
+        fs::write(&stale_pdf, b"stale").unwrap();
+
+        let removed = super::remove_stale_cache_entries(
+            &cache_dir,
+            &active_cache,
+            std::time::SystemTime::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert!(removed >= 2);
+        assert!(active_pdf.exists());
+        assert!(!stale_pdf.exists());
+        assert!(!stale_cache.exists());
+    }
+
+    #[test]
+    fn cache_sweep_stamp_defers_repeat_cleanup() {
+        let temp_dir = tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+
+        assert!(super::cache_sweep_is_due(cache_dir));
+        super::mark_cache_sweep(cache_dir);
+        assert!(!super::cache_sweep_is_due(cache_dir));
+    }
+
+    #[test]
     fn first_changed_frame_detects_stale_related_file() {
         let temp_dir = tempdir().unwrap();
         let cache_dir = temp_dir.path().join("cache");
@@ -2715,6 +3668,21 @@ mod tests {
     }
 
     #[test]
+    fn compiled_output_is_not_fresh_when_pdf_is_incomplete() {
+        let temp_dir = tempdir().unwrap();
+        let dependency = temp_dir.path().join("plot.pdf");
+        let compiled_pdf = temp_dir.path().join("frame.pdf");
+
+        fs::write(&dependency, b"dependency").unwrap();
+        fs::write(&compiled_pdf, b"%PDF-1.5\nmissing trailer").unwrap();
+
+        assert!(!super::compiled_output_is_fresh(
+            &compiled_pdf,
+            &[dependency]
+        ));
+    }
+
+    #[test]
     fn lualatex_format_dump_accepts_backend_failure_after_dump() {
         let temp_dir = tempdir().unwrap();
         let format_path = temp_dir.path().join("preamble.fmt");
@@ -2740,8 +3708,11 @@ mod tests {
         let log_path = temp_dir.path().join("preamble.log");
 
         fs::write(&format_path, b"format").unwrap();
-        fs::write(&log_path, "! error:  (pdf backend): already written content discarded, no output file produced.")
-            .unwrap();
+        fs::write(
+            &log_path,
+            "! error:  (pdf backend): already written content discarded, no output file produced.",
+        )
+        .unwrap();
 
         assert!(!super::lualatex_format_dump_completed_after_backend_error(
             &format_path,

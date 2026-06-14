@@ -28,3 +28,40 @@
 - Explained the LuaLaTeX preamble dump warning, where LuaTeX reports a PDF backend shutdown error after producing a usable `.fmt`.
 - Began improving compile-error reporting after feedback that the current version reports LaTeX failures poorly.
 - Reworked LaTeX compile failure reporting to avoid dumping full transcripts, added concise error extraction tests, and verified the terminal output with a temporary failing Beamer fixture.
+
+## 2026-06-07
+
+- Adjusted frame numbering so title and TOC frames are labeled as `title`/`toc` and excluded from numeric frame counts.
+- Updated compile status, retry progress, failure logs, and preview publish messages to use the adjusted frame labels.
+- Added unit tests for title/TOC label handling and verified the suite with `cargo test`.
+
+## 2026-06-08
+
+- Refined TOC handling so only the optional front-matter TOC is labeled `toc`; later TOC-like frames follow normal numbering.
+- Added tests for decks without a TOC and for section-title frames participating in the implicit frame-number sequence.
+- Added input resolution that appends `.tex` when the provided input path is missing and does not already end in `.tex`.
+- Updated watch-mode path comparison and added tests for bare input, existing bare files, and explicit `.tex` paths.
+
+## 2026-06-09
+
+- Began investigating SMEFT `lualatex` frame failures where generated frame sources start with NUL bytes (`^^@`).
+- Confirmed the generated frame `.tex` sources were valid and the NUL bytes came from a corrupted cached frame `.aux` file.
+- Added cleanup of stale frame sidecar files before each frame compile so serial retries do not reuse corrupted `.aux` files.
+- Verified with `cargo test` and a successful patched run on `SMEFT_TFR/Notes/Slides/IMU.tex` using `-X -f -m=3 -p --engine=lualatex`.
+- Began adjusting TOC frame rendering so the front-matter table-of-contents frame does not show a bottom-right frame number.
+- Added TOC-only frame-number display suppression for Beamer themes that draw the footer with `\insertframenumber`.
+- Added PDF completeness validation so damaged cached frame PDFs are recompiled or reported before `pdfunite`.
+- Verified the updated suite with `cargo test` after adding TOC display and PDF validation regression tests.
+
+## 2026-06-11
+
+- Began investigating report that definitions placed between Beamer frames are not picked up by isolated frame compilation.
+- Added between-frame document-context extraction for definition/setup commands so later isolated frame builds see macros, colors, counters, and similar definitions placed after earlier frames.
+- Added regression tests for accumulated single-line and multi-line between-frame definitions while ignoring section commands that can trigger Beamer hook output.
+
+## 2026-06-14
+
+- Added automatic garbage removal for the dedicated `faster-beamer` cache directory, preserving the active deck cache, pruning stale entries older than 30 days, and throttling cleanup to once per day with a stamp file.
+- Added regression tests for stale cache pruning and cleanup-stamp throttling, then verified the suite with `cargo test`.
+- Explained why files accumulate in the faster-beamer cache: frame-level incremental compilation, LaTeX sidecar output, precompiled preambles, and interrupted or failed builds can leave reusable or stale artifacts behind.
+- Prepared the tracked faster-beamer changes for git commit and push while leaving local untracked scratch files out of the commit.
