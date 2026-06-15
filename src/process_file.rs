@@ -18,7 +18,7 @@ use clap::ArgMatches;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env::current_dir;
 use std::fs;
 use std::fs::write;
@@ -127,6 +127,13 @@ struct UnitedCompileArtifacts {
     tex_file: PathBuf,
     pdf_file: PathBuf,
     sync_map: FrameSyncTexMap,
+}
+
+struct ParsedSyncTex {
+    header_lines: Vec<String>,
+    input_lines: Vec<(u32, String)>,
+    content_lines: Vec<String>,
+    record_count: usize,
 }
 
 struct FrameCompileFailure {
@@ -656,6 +663,301 @@ fn publish_output_artifacts(
     }
 }
 
+fn read_synctex_contents(synctex_file: &Path) -> std::result::Result<String, String> {
+    let compressed = std::fs::read(synctex_file)
+        .map_err(|err| format!("failed to read {}: {}", synctex_file.display(), err))?;
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut content = String::new();
+    decoder
+        .read_to_string(&mut content)
+        .map_err(|err| format!("failed to decode {}: {}", synctex_file.display(), err))?;
+    Ok(content)
+}
+
+fn synctex_page_open(line: &str) -> Option<usize> {
+    line.strip_prefix('{')?.parse::<usize>().ok()
+}
+
+fn synctex_page_close(line: &str) -> Option<usize> {
+    line.strip_prefix('}')?.parse::<usize>().ok()
+}
+
+fn parse_synctex_record_count(lines: &[String], postamble_idx: usize) -> usize {
+    lines[postamble_idx + 1..]
+        .iter()
+        .find_map(|line| line.strip_prefix("Count:")?.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn parse_synctex_document(content: &str) -> std::result::Result<ParsedSyncTex, String> {
+    let lines: Vec<String> = content.lines().map(str::to_owned).collect();
+    let content_idx = lines
+        .iter()
+        .position(|line| line == "Content:")
+        .ok_or_else(|| String::from("SyncTeX file has no Content section"))?;
+    let postamble_idx = lines
+        .iter()
+        .position(|line| line == "Postamble:")
+        .ok_or_else(|| String::from("SyncTeX file has no Postamble section"))?;
+
+    if postamble_idx <= content_idx {
+        return Err(String::from("SyncTeX Postamble appears before Content"));
+    }
+
+    let header_lines = lines[..content_idx].to_vec();
+    let input_lines: Vec<(u32, String)> = lines[..postamble_idx]
+        .iter()
+        .filter_map(|line| parse_synctex_input_line(line).map(|(tag, path)| (tag, path.to_owned())))
+        .collect();
+
+    if input_lines.is_empty() {
+        return Err(String::from("SyncTeX file has no Input lines"));
+    }
+
+    Ok(ParsedSyncTex {
+        header_lines,
+        input_lines,
+        content_lines: lines[content_idx + 1..postamble_idx].to_vec(),
+        record_count: parse_synctex_record_count(&lines, postamble_idx),
+    })
+}
+
+fn remap_synctex_global_tag(
+    line: &str,
+    tag_map: &HashMap<u32, u32>,
+) -> std::result::Result<String, String> {
+    let first_char = match line.chars().next() {
+        Some(ch) if matches!(ch, '[' | '(' | 'x' | 'k' | 'g' | '$' | 'v' | 'h' | 'r') => ch,
+        _ => return Ok(line.to_owned()),
+    };
+
+    let prefix_len = first_char.len_utf8();
+    let rest = &line[prefix_len..];
+    let colon_idx = match rest.find(':') {
+        Some(idx) => idx,
+        None => return Ok(line.to_owned()),
+    };
+    let link = &rest[..colon_idx];
+    let mut parts = link.split(',');
+    let tag = match parts.next().and_then(|part| part.parse::<u32>().ok()) {
+        Some(tag) => tag,
+        None => return Ok(line.to_owned()),
+    };
+    let global_tag = tag_map
+        .get(&tag)
+        .ok_or_else(|| format!("SyncTeX record references unknown input tag {}", tag))?;
+
+    let mut rewritten_link = global_tag.to_string();
+    for part in parts {
+        rewritten_link.push(',');
+        rewritten_link.push_str(part);
+    }
+
+    Ok(format!(
+        "{}{}{}",
+        &line[..prefix_len],
+        rewritten_link,
+        &rest[colon_idx..]
+    ))
+}
+
+fn rewrite_synctex_content_lines(
+    content_lines: &[String],
+    page_offset: usize,
+    tag_map: &HashMap<u32, u32>,
+) -> std::result::Result<(Vec<String>, usize), String> {
+    let mut rewritten = Vec::with_capacity(content_lines.len());
+    let mut local_page_count = 0usize;
+
+    for line in content_lines {
+        if parse_synctex_input_line(line).is_some() {
+            continue;
+        }
+
+        if let Some(page_number) = synctex_page_open(line) {
+            if page_number == 0 {
+                rewritten.push(line.clone());
+            } else {
+                local_page_count = local_page_count.max(page_number);
+                rewritten.push(format!("{{{}", page_offset + page_number));
+            }
+        } else if let Some(page_number) = synctex_page_close(line) {
+            if page_number == 0 {
+                rewritten.push(line.clone());
+            } else {
+                local_page_count = local_page_count.max(page_number);
+                rewritten.push(format!("}}{}", page_offset + page_number));
+            }
+        } else {
+            rewritten.push(remap_synctex_global_tag(line, tag_map)?);
+        }
+    }
+
+    if local_page_count == 0 {
+        Err(String::from("SyncTeX content has no page sheet records"))
+    } else {
+        Ok((rewritten, local_page_count))
+    }
+}
+
+fn append_merged_synctex_header(
+    merged_lines: &mut Vec<String>,
+    header_lines: &[String],
+    input_lines: &[(u32, String)],
+    output_file: &str,
+) {
+    let output_line = format!("Output:{}", synctex_path(Path::new(output_file)));
+    let mut inserted_inputs = false;
+    let mut wrote_output = false;
+
+    for line in header_lines {
+        if parse_synctex_input_line(line).is_some() {
+            if !inserted_inputs {
+                for (tag, path) in input_lines {
+                    merged_lines.push(format!("Input:{}:{}", tag, path));
+                }
+                inserted_inputs = true;
+            }
+            continue;
+        }
+
+        if line.starts_with("Output:") {
+            if !inserted_inputs {
+                for (tag, path) in input_lines {
+                    merged_lines.push(format!("Input:{}:{}", tag, path));
+                }
+                inserted_inputs = true;
+            }
+            merged_lines.push(output_line.clone());
+            wrote_output = true;
+        } else {
+            merged_lines.push(line.clone());
+        }
+    }
+
+    if !inserted_inputs {
+        for (tag, path) in input_lines {
+            merged_lines.push(format!("Input:{}:{}", tag, path));
+        }
+    }
+
+    if !wrote_output {
+        merged_lines.push(output_line);
+    }
+}
+
+fn build_merged_frame_synctex(
+    generated_documents: &[GeneratedDocument],
+    cache_subdir: &Path,
+    output_file: &str,
+) -> std::result::Result<(String, usize), String> {
+    let mut first_header_lines = None;
+    let mut global_tag_by_path = HashMap::new();
+    let mut global_input_lines = Vec::new();
+    let mut merged_page_lines = Vec::new();
+    let mut page_offset = 0usize;
+    let mut record_count = 0usize;
+
+    for document in generated_documents {
+        let frame_pdf = compiled_pdf_path(cache_subdir, &document.sync_map.temp_file_name);
+        let synctex_file = frame_pdf.with_extension("synctex.gz");
+        let content = read_synctex_contents(&synctex_file)?;
+        let remapped_content = remap_synctex_contents(&content, &document.sync_map);
+        let parsed = parse_synctex_document(&remapped_content)?;
+        let mut local_tag_map = HashMap::new();
+
+        if first_header_lines.is_none() {
+            first_header_lines = Some(parsed.header_lines.clone());
+        }
+        record_count += parsed.record_count;
+
+        for (local_tag, path) in parsed.input_lines {
+            let global_tag = match global_tag_by_path.get(&path) {
+                Some(tag) => *tag,
+                None => {
+                    let tag = (global_input_lines.len() + 1) as u32;
+                    global_tag_by_path.insert(path.clone(), tag);
+                    global_input_lines.push((tag, path));
+                    tag
+                }
+            };
+            local_tag_map.insert(local_tag, global_tag);
+        }
+
+        let (rewritten, local_page_count) =
+            rewrite_synctex_content_lines(&parsed.content_lines, page_offset, &local_tag_map)?;
+        merged_page_lines.extend(rewritten);
+        page_offset += local_page_count;
+    }
+
+    let header_lines =
+        first_header_lines.ok_or_else(|| String::from("there are no frame SyncTeX files"))?;
+    let page_count = page_offset;
+    let mut merged_lines = Vec::new();
+    append_merged_synctex_header(
+        &mut merged_lines,
+        &header_lines,
+        &global_input_lines,
+        output_file,
+    );
+    merged_lines.push(String::from("Content:"));
+    merged_lines.extend(merged_page_lines);
+    merged_lines.push(String::from("Postamble:"));
+    merged_lines.push(format!("Count:{}", record_count));
+    merged_lines.push(String::from("!0"));
+    merged_lines.push(String::from("Post scriptum:"));
+
+    let mut merged = merged_lines.join("\n");
+    merged.push('\n');
+    Ok((merged, page_count))
+}
+
+fn publish_synctex_contents(content: &str, output_file: &str) -> Result<()> {
+    let output_synctex = Path::new(output_file).with_extension("synctex.gz");
+    if let Some(parent) = output_synctex.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| {
+                error!(
+                    "Failed to create SyncTeX output directory {}: {}",
+                    parent.display(),
+                    err
+                );
+                FasterBeamerError::IoError
+            })?;
+        }
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(content.as_bytes()).map_err(|err| {
+        error!(
+            "Failed to encode SyncTeX for {}: {}",
+            output_synctex.display(),
+            err
+        );
+        FasterBeamerError::IoError
+    })?;
+    let compressed = encoder.finish().map_err(|err| {
+        error!(
+            "Failed to finish SyncTeX encoding for {}: {}",
+            output_synctex.display(),
+            err
+        );
+        FasterBeamerError::IoError
+    })?;
+
+    fs::write(&output_synctex, compressed).map_err(|err| {
+        error!(
+            "Failed to write SyncTeX file {}: {}",
+            output_synctex.display(),
+            err
+        );
+        FasterBeamerError::IoError
+    })?;
+
+    info!("Published SyncTeX: {}", output_synctex.display());
+    Ok(())
+}
+
 fn rewrite_synctex_to_original(compiled_pdf: &Path, sync_map: &FrameSyncTexMap) -> Result<()> {
     let synctex_file = compiled_pdf.with_extension("synctex.gz");
     if !synctex_file.is_file() {
@@ -768,7 +1070,10 @@ fn remap_synctex_link_line(
     sync_map: &FrameSyncTexMap,
 ) -> Option<String> {
     let first_char = line.chars().next()?;
-    if !matches!(first_char, '[' | '(' | 'x' | 'k' | 'g' | '$' | 'v' | 'h') {
+    if !matches!(
+        first_char,
+        '[' | '(' | 'x' | 'k' | 'g' | '$' | 'v' | 'h' | 'r'
+    ) {
         return None;
     }
 
@@ -3168,38 +3473,62 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
             }
             Ok(_) => {
                 if pdfunite_with_synctex {
-                    match compile_united_artifacts(
-                        &parsed_file.file_content,
-                        &frames,
-                        &frame_source_lines,
+                    match build_merged_frame_synctex(
                         &generated_documents,
                         &cache_subdir,
-                        &original_source_path,
-                        &input_dir,
-                        selected_engine,
-                        &compiler_options,
-                        run_options,
+                        &output_file,
                     ) {
-                        Ok(united) => {
+                        Ok((merged_synctex, page_count)) => {
                             publish_output_file(&merged_pdf, &output_file)?;
-                            rewrite_synctex_to_original(&united.pdf_file, &united.sync_map)?;
-                            publish_synctex_file(&united.pdf_file, &output_file)?;
-                            if let Err(err) = std::fs::remove_file(&united.tex_file) {
-                                warn!(
-                                    "Failed to remove temporary united source {}: {}",
-                                    united.tex_file.display(),
-                                    err
-                                );
-                            }
+                            publish_synctex_contents(&merged_synctex, &output_file)?;
+                            info!(
+                                "SyncTeX: merged {} page(s) from frame sidecars; skipped united TeX compile.",
+                                page_count
+                            );
                         }
-                        Err(err) => {
-                            publish_output_artifacts(&merged_pdf, &output_file, None)?;
+                        Err(merge_error) => {
                             warn!(
-                                "Published the pdfunite output without SyncTeX because the temporary united TeX build failed."
+                                "Failed to merge frame SyncTeX directly ({}); falling back to a temporary united TeX build.",
+                                merge_error
                             );
 
-                            *PREVIOUS_FRAMES.lock().unwrap() = frames;
-                            return Err(err);
+                            match compile_united_artifacts(
+                                &parsed_file.file_content,
+                                &frames,
+                                &frame_source_lines,
+                                &generated_documents,
+                                &cache_subdir,
+                                &original_source_path,
+                                &input_dir,
+                                selected_engine,
+                                &compiler_options,
+                                run_options,
+                            ) {
+                                Ok(united) => {
+                                    publish_output_file(&merged_pdf, &output_file)?;
+                                    rewrite_synctex_to_original(
+                                        &united.pdf_file,
+                                        &united.sync_map,
+                                    )?;
+                                    publish_synctex_file(&united.pdf_file, &output_file)?;
+                                    if let Err(err) = std::fs::remove_file(&united.tex_file) {
+                                        warn!(
+                                            "Failed to remove temporary united source {}: {}",
+                                            united.tex_file.display(),
+                                            err
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    publish_output_artifacts(&merged_pdf, &output_file, None)?;
+                                    warn!(
+                                        "Published the pdfunite output without SyncTeX because the temporary united TeX build failed."
+                                    );
+
+                                    *PREVIOUS_FRAMES.lock().unwrap() = frames;
+                                    return Err(err);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -3282,6 +3611,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::build_merged_frame_synctex;
     use super::collect_related_files;
     use super::document_contexts_before_frames;
     use super::document_sections;
@@ -3296,8 +3626,13 @@ mod tests {
     use super::FrameLabel;
     use super::FrameSyncTexMap;
     use super::GeneratedDocument;
+    use super::SyncTexLineSegment;
     use super::TocFrameSupport;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::fs;
+    use std::io::Write;
+    use std::path::Path;
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -3318,6 +3653,12 @@ mod tests {
             .map(|snippet| snippet.content.as_str())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn write_synctex_fixture(path: &Path, content: &str) {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(content.as_bytes()).unwrap();
+        fs::write(path, encoder.finish().unwrap()).unwrap();
     }
 
     #[test]
@@ -3499,6 +3840,142 @@ A\n\
         assert!(replacement.contains("\\setbeamertemplate{headline}{}"));
         assert!(replacement.contains("\\setbeamertemplate{navigation symbols}{}"));
         assert!(replacement.contains("pagecommand={\\thispagestyle{empty}"));
+    }
+
+    #[test]
+    fn merged_frame_synctex_combines_pages_and_remaps_input_tags() {
+        let temp_dir = tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+        let source_file = temp_dir.path().join("slides.tex");
+        let document_a = GeneratedDocument {
+            tex_content: String::new(),
+            sync_map: FrameSyncTexMap {
+                source_file: source_file.clone(),
+                temp_file_name: String::from("frame-a.tex"),
+                segments: vec![SyncTexLineSegment {
+                    temp_start_line: 10,
+                    line_count: 3,
+                    source_start_line: 100,
+                }],
+            },
+            dependencies: Vec::new(),
+            support_files: Vec::new(),
+        };
+        let document_b = GeneratedDocument {
+            tex_content: String::new(),
+            sync_map: FrameSyncTexMap {
+                source_file: source_file.clone(),
+                temp_file_name: String::from("frame-b.tex"),
+                segments: vec![SyncTexLineSegment {
+                    temp_start_line: 5,
+                    line_count: 2,
+                    source_start_line: 200,
+                }],
+            },
+            dependencies: Vec::new(),
+            support_files: Vec::new(),
+        };
+
+        write_synctex_fixture(
+            &cache_dir.join("frame-a.synctex.gz"),
+            "SyncTeX Version:1\n\
+Input:1:frame-a.tex\n\
+Input:2:common.sty\n\
+Output:frame-a.pdf\n\
+Magnification:1000\n\
+Unit:1\n\
+X Offset:0\n\
+Y Offset:0\n\
+Content:\n\
+!944\n\
+{1\n\
+[1,10:0,0:0,0,0\n\
+x2,3:0,0\n\
+!97\n\
+}1\n\
+Postamble:\n\
+Count:10\n\
+!123\n\
+Post scriptum:\n",
+        );
+        write_synctex_fixture(
+            &cache_dir.join("frame-b.synctex.gz"),
+            "SyncTeX Version:1\n\
+Input:7:frame-b.tex\n\
+Input:8:common.sty\n\
+Output:frame-b.pdf\n\
+Magnification:1000\n\
+Unit:1\n\
+X Offset:0\n\
+Y Offset:0\n\
+Content:\n\
+!120\n\
+{1\n\
+(7,5:0,0:0,0,0\n\
+x8,4:0,0\n\
+g9,4:0,0\n\
+r9,4:0,0:0,0,0\n\
+Input:9:late.sty\n\
+}1\n\
+!240\n\
+{2\n\
+[7,6:0,0:0,0,0\n\
+}2\n\
+Postamble:\n\
+Count:20\n\
+!456\n\
+Post scriptum:\n",
+        );
+
+        let (merged, page_count) =
+            build_merged_frame_synctex(&[document_a, document_b], cache_dir, "merged.pdf").unwrap();
+        let source_path = super::synctex_path(&source_file);
+
+        assert_eq!(page_count, 3);
+        assert_eq!(
+            merged.matches(&format!("Input:1:{}", source_path)).count(),
+            1
+        );
+        assert_eq!(merged.matches("Input:2:common.sty").count(), 1);
+        assert_eq!(merged.matches("Input:3:late.sty").count(), 1);
+        assert!(merged.contains("Output:merged.pdf"));
+        assert!(merged.contains("\n{1\n"));
+        assert!(merged.contains("\n{2\n"));
+        assert!(merged.contains("\n{3\n"));
+        assert!(merged.contains("\n}1\n"));
+        assert!(merged.contains("\n}2\n"));
+        assert!(merged.contains("\n}3\n"));
+        assert!(merged.contains("[1,100:0,0:0,0,0"));
+        assert!(merged.contains("(1,200:0,0:0,0,0"));
+        assert!(merged.contains("[1,201:0,0:0,0,0"));
+        assert!(merged.contains("x2,3:0,0"));
+        assert!(merged.contains("x2,4:0,0"));
+        assert!(merged.contains("g3,4:0,0"));
+        assert!(merged.contains("r3,4:0,0:0,0,0"));
+        assert!(merged.contains("Count:30"));
+        assert!(!merged.contains("frame-a.tex"));
+        assert!(!merged.contains("frame-b.tex"));
+    }
+
+    #[test]
+    fn merged_frame_synctex_reports_missing_sidecar() {
+        let temp_dir = tempdir().unwrap();
+        let source_file = temp_dir.path().join("slides.tex");
+        let document = GeneratedDocument {
+            tex_content: String::new(),
+            sync_map: FrameSyncTexMap {
+                source_file,
+                temp_file_name: String::from("missing.tex"),
+                segments: Vec::new(),
+            },
+            dependencies: Vec::new(),
+            support_files: Vec::new(),
+        };
+
+        let error =
+            build_merged_frame_synctex(&[document], temp_dir.path(), "merged.pdf").unwrap_err();
+
+        assert!(error.contains("failed to read"));
     }
 
     #[test]

@@ -70,3 +70,10 @@
 - Investigated Windows `os error 32` stale sidecar cleanup warnings and extended retry backoff for transient file locks before reporting cleanup failure.
 - Extended stale sidecar cleanup to cover static TeX dependencies from `\input` and `\include`, preserving source files while clearing cached LaTeX sidecars.
 - Prepared guard-process and stale sidecar cleanup changes for git commit and push, excluding local scratch files from the commit.
+
+## 2026-06-15
+
+- Optimized `--pdfunite-synctex` by merging existing per-frame SyncTeX sidecars after `pdfunite`, skipping the temporary united TeX compile on the fast path while keeping the old compile fallback.
+- Added SyncTeX merge regression tests for page-number shifting, input-tag renumbering, content-section `Input:` records, and missing sidecar fallback.
+- Verified with `cargo test` and a real `test/feature-tour.tex -X` smoke build; the cached smoke run merged 10 pages from frame sidecars and skipped the united TeX compile.
+- Prepared the SyncTeX optimization changes for the requested git commit and push, staging only tracked implementation and log files.
