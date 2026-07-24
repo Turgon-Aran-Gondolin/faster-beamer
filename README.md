@@ -12,7 +12,7 @@ I wanted to have a fast preview of my files even if the output is not 100% corre
 
 ## What it does
 
-It parses your input file and compiles each `frame` enviroment individually.
+It parses your input file and compiles each `frame` environment individually (as well as full-page includes like `\includepdf`).
 Compiled frames are cached and only recompiled if necessary.  
 Of course, frame pages and citation will not be rendered correctly, but it should be sufficient to get an idea
 how your frames will look like.
