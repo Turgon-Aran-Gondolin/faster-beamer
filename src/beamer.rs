@@ -24,6 +24,16 @@ pub fn get_frames(parsed_file: &ParsedFile) -> Vec<Node<'_>> {
             frames.push(t)
         }
     }
+
+    let generic_commands = parsed_file.get_nodes_of_type("generic_command");
+    for cmd in generic_commands {
+        let text = parsed_file.get_node_string(&cmd);
+        if text.starts_with("\\includepdf") {
+            frames.push(cmd);
+        }
+    }
+
+    frames.sort_by_key(|n| n.start_byte());
     frames
 }
 

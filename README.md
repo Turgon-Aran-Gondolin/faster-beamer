@@ -129,6 +129,7 @@ faster-beamer presentation.tex --compiler-option=-draftmode --compiler-option=-f
 
 - The first supported Windows target is `x86_64-pc-windows-msvc`.
 - Use TeX Live on Windows for the initial support path.
+- The cache defaults to `%LOCALAPPDATA%\\faster-beamer`. If an agent or restricted worker cannot write there, set `FASTER_BEAMER_CACHE_DIR` to an absolute writable directory before invoking `faster-beamer`, for example: `$env:FASTER_BEAMER_CACHE_DIR = (Resolve-Path .\\tmp\\faster-beamer-cache).Path`.
 - Install the MSVC Rust toolchain and the Visual C++ Build Tools needed to compile the vendored parser sources.
 - `--tex-unite` is the more portable full-document mode on Windows.
 - `--pdfunite` remains optional and will fail with an actionable error if `pdfunite` is not installed.

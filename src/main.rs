@@ -19,7 +19,7 @@ use std::env::current_dir;
 use std::sync::mpsc;
 use std::{thread, time};
 
-const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex --engine=xelatex\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
+const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex --engine=xelatex\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n  faster-beamer slides.tex --only-frames title,4,Intro\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
 
 fn watch_label(input_file: &str) -> String {
     format!("Watch: monitoring {}", input_file)
@@ -232,6 +232,20 @@ fn main() {
                 .value_name("FILE")
                 .conflicts_with("OUTPUT")
                 .help("Write the output PDF to FILE"),
+        )
+        .arg(
+            Arg::with_name("global-title-info")
+                .long("global-title-info")
+                .help("Inject title page information into all frames instead of only frames that request it"),
+        )
+        .arg(
+            Arg::with_name("only-frames")
+                .long("only-frames")
+                .takes_value(true)
+                .multiple(true)
+                .use_delimiter(true)
+                .value_name("FRAMES")
+                .help("Only compile specific frames (e.g., 'title', 'toc', '4', 'Introduction')"),
         )
         .arg(
             Arg::with_name("OUTPUT")

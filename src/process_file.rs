@@ -168,7 +168,7 @@ enum TocFrameSupport {
 
 lazy_static! {
     static ref FRAME_REGEX: Regex =
-        Regex::new(r"(?ms)^[ \t]*\\begin\{frame\}.*?^[ \t]*\\end\{frame\}|^[ \t]*\\sectiontitlepage\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|^[ \t]*\\titlepage\b").unwrap();
+        Regex::new(r"(?ms)^[ \t]*\\begin\{frame\}.*?^[ \t]*\\end\{frame\}|^[ \t]*\\sectiontitlepage\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|^[ \t]*\\titlepage\b|^[ \t]*\\includepdf\b(?:[ \t]*\[[^\]]*\])?[ \t]*\{[^{}]*\}").unwrap();
 }
 lazy_static! {
     static ref SECTION_LINE_REGEX: Regex = Regex::new(
@@ -203,7 +203,7 @@ lazy_static! {
 lazy_static! {
     static ref RELATED_FILE_REGEX: Regex = Regex::new(
         r"(?sx)
-        \\(?P<command>includegraphics|input|include)
+        \\(?P<command>includegraphics|includepdf|input|include)
         (?:\s*\[[^\]]*\])?
         \s*\{
             (?P<path>[^}]*)
@@ -1261,6 +1261,49 @@ fn is_document_context_command(command: &str) -> bool {
         || command.starts_with("Provide")
 }
 
+fn is_title_info_command(command: &str) -> bool {
+    matches!(
+        command,
+        "title" | "subtitle" | "author" | "date" | "institute"
+    )
+}
+
+fn extract_title_commands(preamble: &mut String) -> String {
+    let mut cleaned_preamble = String::with_capacity(preamble.len());
+    let mut title_info = String::new();
+    let mut collecting = false;
+    let mut balance = 0isize;
+
+    for line in preamble.split_inclusive('\n') {
+        let uncommented = strip_tex_comment_from_line(line);
+
+        if collecting {
+            title_info.push_str(line);
+            balance += brace_delta(uncommented);
+            if balance <= 0 {
+                collecting = false;
+                balance = 0;
+            }
+        } else if command_name_at_line_start(uncommented)
+            .map(is_title_info_command)
+            .unwrap_or(false)
+        {
+            title_info.push_str(line);
+            balance = brace_delta(uncommented);
+            if balance <= 0 {
+                balance = 0;
+            } else {
+                collecting = true;
+            }
+        } else {
+            cleaned_preamble.push_str(line);
+        }
+    }
+
+    *preamble = cleaned_preamble;
+    title_info
+}
+
 fn extract_document_context_snippets(
     source_content: &str,
     segment_start_idx: usize,
@@ -1406,6 +1449,33 @@ fn frame_labels(frames: &[String]) -> Vec<FrameLabel> {
             }
         })
         .collect()
+}
+
+fn frame_matches_filter(frame_label: &FrameLabel, frame_content: &str, filters: &[String]) -> bool {
+    for filter in filters {
+        if filter.eq_ignore_ascii_case("title") {
+            if matches!(frame_label, FrameLabel::Title) {
+                return true;
+            }
+            continue;
+        }
+        if filter.eq_ignore_ascii_case("toc") {
+            if matches!(frame_label, FrameLabel::Toc) {
+                return true;
+            }
+            continue;
+        }
+        if let Ok(num) = filter.parse::<usize>() {
+            if matches!(frame_label, FrameLabel::Number(n) if *n == num) {
+                return true;
+            }
+            continue;
+        }
+        if frame_content.contains(filter) {
+            return true;
+        }
+    }
+    false
 }
 
 fn table_of_contents_uses_dynamic_section_context(frame: &str) -> bool {
@@ -1631,7 +1701,7 @@ fn resolve_related_file(
     };
 
     match command {
-        "includegraphics" => resolve_graphics_from_paths(raw_path, graphics_paths),
+        "includegraphics" | "includepdf" => resolve_graphics_from_paths(raw_path, graphics_paths),
         "input" | "include" => Some(resolve_tex_dependency(&path)),
         _ => Some(path),
     }
@@ -2310,9 +2380,11 @@ fn current_cache_paths(input_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
         .unwrap_or(&cwd)
         .canonicalize()
         .unwrap_or_else(|_| cwd.to_owned());
-    let cachedir = dirs::cache_dir()
-        .expect("This OS is not supported")
-        .join("faster-beamer");
+    let cachedir = std::env::var_os("FASTER_BEAMER_CACHE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::cache_dir().map(|path| path.join("faster-beamer")))
+        .expect("This OS is not supported");
     let cache_subdir = cache_path(&cachedir, &input_dir);
 
     (input_dir, cachedir, cache_subdir)
@@ -2732,6 +2804,7 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     }
     let frame_labels = frame_labels(&frames);
     let numbered_frame_count = numbered_frame_count(&frame_labels);
+
     info!(
         "Build: {} -> {} [{}]",
         original_source_path.display(),
@@ -2785,11 +2858,17 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
     //input_file
     /*);*/
     let find = parsed_file.file_content.find("\\begin{document}");
-    let preamble = match find {
+    let mut preamble = match find {
         Some(x) => Some(parsed_file.file_content[..x].to_owned()),
         None => None,
     }
     .unwrap_or_else(|| r"\documentclass[aspectratio=43,c,xcolor=dvipsnames]{beamer}".to_string());
+
+    let title_info = if !args.is_present("global-title-info") {
+        extract_title_commands(&mut preamble)
+    } else {
+        String::new()
+    };
 
     std::fs::create_dir_all(&cachedir).map_err(|ref err| {
         error!(
@@ -2991,7 +3070,19 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
                 (String::new(), Vec::new(), Vec::new())
             }
         };
+        let needs_title_info = f.contains("\\titlepage")
+            || f.contains("\\maketitle")
+            || f.contains("\\inserttitle")
+            || f.contains("\\insertauthor")
+            || f.contains("\\insertdate")
+            || f.contains("\\insertinstitute")
+            || f.contains("\\insertsubtitle");
+
         let mut compile_prefix = format_line.clone() + &preamble + "\n\\begin{document}\n";
+        if needs_title_info && !title_info.is_empty() {
+            compile_prefix.push_str(&title_info);
+            compile_prefix.push('\n');
+        }
         let mut context_segments = Vec::new();
         append_document_context(&mut compile_prefix, &mut context_segments, document_context);
         compile_prefix.push_str(&counter_setup);
@@ -3103,8 +3194,22 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
 
         let compiled_pdf = compiled_pdf_path(&cache_subdir, &document.sync_map.temp_file_name);
         let dependencies = dependencies_for_document(&cache_subdir, document);
-        let needs_compile =
+        let mut needs_compile =
             force_recompile || !compiled_output_is_fresh(&compiled_pdf, &dependencies);
+
+        let only_frames: Option<Vec<String>> = args.values_of("only-frames").map(|v| v.map(|s| s.to_string()).collect());
+        if let Some(filters) = &only_frames {
+            if !frame_matches_filter(&frame_labels[frame_idx], &frames[frame_idx], filters) {
+                if compiled_pdf.exists() {
+                    needs_compile = false;
+                } else {
+                    warn!(
+                        "Frame {} skipped by --only-frames but cached PDF is missing. Compiling anyway to satisfy pdfunite.",
+                        frame_label_for_index(&frame_labels, frame_idx, numbered_frame_count)
+                    );
+                }
+            }
+        }
 
         if needs_compile {
             compile_targets.push((frame_idx, document, needs_compile));
