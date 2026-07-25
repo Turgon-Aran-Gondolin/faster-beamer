@@ -2934,13 +2934,13 @@ pub fn process_file(input_file: &str, args: &ArgMatches) -> Result<()> {
         command
             .arg("-shell-escape")
             .arg("-ini")
-            .arg(format!("-jobname={}", preamble_filename))
-            .arg(format!("&{}", selected_engine.command_name()))
-            .arg("mylatexformat.ltx");
+            .arg(format!("-jobname={}", preamble_filename));
         for option in &compiler_options {
             command.arg(option);
         }
         let output = command
+            .arg(format!("&{}", selected_engine.command_name()))
+            .arg("mylatexformat.ltx")
             .arg(tex_input_name(&input_path))
             .current_dir(&input_dir)
             .output();
