@@ -4,7 +4,7 @@
 // Distributed under terms of the GPLv3 license.
 //
 use crate::beamer::get_frames;
-use crate::fs_utils::{cache_path, publish_file};
+use crate::fs_utils::{cache_path, configured_cache_dir, publish_file};
 use crate::latexcompile::{BibliographyTool, LatexEngine};
 use crate::parsing;
 
@@ -2380,11 +2380,7 @@ fn current_cache_paths(input_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
         .unwrap_or(&cwd)
         .canonicalize()
         .unwrap_or_else(|_| cwd.to_owned());
-    let cachedir = std::env::var_os("FASTER_BEAMER_CACHE_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| dirs::cache_dir().map(|path| path.join("faster-beamer")))
-        .expect("This OS is not supported");
+    let cachedir = configured_cache_dir().expect("This OS is not supported");
     let cache_subdir = cache_path(&cachedir, &input_dir);
 
     (input_dir, cachedir, cache_subdir)
@@ -2637,6 +2633,91 @@ pub fn clean_generated_artifacts(input_file: &str, args: &ArgMatches) -> Result<
         "Removed faster-beamer artifacts for {} ({} stale source temp files).",
         input_file, removed_input_files
     );
+
+    Ok(())
+}
+
+pub fn clean_all_generated_artifacts() -> Result<()> {
+    let cachedir = configured_cache_dir().expect("This OS is not supported");
+    if cachedir
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        error!(
+            "Refusing to clean a cache path containing a parent component: {}",
+            cachedir.display()
+        );
+        return Err(FasterBeamerError::IoError);
+    }
+    if cachedir.parent().is_none() {
+        error!(
+            "Refusing to remove a filesystem root configured as the cache: {}",
+            cachedir.display()
+        );
+        return Err(FasterBeamerError::IoError);
+    }
+    match crate::guard::has_live_guards() {
+        Ok(true) => {
+            error!("Refusing to clean all caches while a faster-beamer watcher is active.");
+            return Err(FasterBeamerError::IoError);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            error!("Failed to inspect watcher guards: {}", err);
+            return Err(FasterBeamerError::IoError);
+        }
+    }
+
+    match std::fs::symlink_metadata(&cachedir) {
+        Ok(metadata) if metadata.is_dir() => {
+            let resolved_cachedir = std::fs::canonicalize(&cachedir).map_err(|err| {
+                error!(
+                    "Failed to resolve cache directory {}: {}",
+                    cachedir.display(),
+                    err
+                );
+                FasterBeamerError::IoError
+            })?;
+            if resolved_cachedir.parent().is_none() {
+                error!(
+                    "Refusing to remove a filesystem root configured as the cache: {}",
+                    cachedir.display()
+                );
+                return Err(FasterBeamerError::IoError);
+            }
+
+            std::fs::remove_dir_all(&resolved_cachedir).map_err(|err| {
+                error!(
+                    "Failed to remove cache directory {}: {}",
+                    cachedir.display(),
+                    err
+                );
+                FasterBeamerError::IoError
+            })?;
+            info!(
+                "Removed all faster-beamer cached artifacts from {}.",
+                cachedir.display()
+            );
+        }
+        Ok(_) => {
+            error!(
+                "Configured cache path is not a directory: {}",
+                cachedir.display()
+            );
+            return Err(FasterBeamerError::IoError);
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            info!("No faster-beamer cache found at {}.", cachedir.display());
+        }
+        Err(err) => {
+            error!(
+                "Failed to inspect cache directory {}: {}",
+                cachedir.display(),
+                err
+            );
+            return Err(FasterBeamerError::IoError);
+        }
+    }
 
     Ok(())
 }

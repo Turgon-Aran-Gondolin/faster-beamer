@@ -19,7 +19,7 @@ use std::env::current_dir;
 use std::sync::mpsc;
 use std::{thread, time};
 
-const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex --engine=xelatex\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n  faster-beamer slides.tex --only-frames title,4,Intro\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  Full-page includes (like \\includepdf) are treated as individual frames.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
+const HELP_EPILOGUE: &str = "Examples:\n  faster-beamer slides.tex\n  faster-beamer slides.tex -u\n  faster-beamer slides.tex -X -o slides.pdf\n  faster-beamer slides.tex --engine=xelatex\n  faster-beamer slides.tex -C=-draftmode -C=-file-line-error\n  faster-beamer slides.tex --only-frames title,4,Intro\n  faster-beamer --clean\n\nNotes:\n  Without -u/--tex-unite, -x/--pdfunite, or -X/--pdfunite-synctex, faster-beamer publishes only the newest frame.\n  Full-page includes (like \\includepdf) are treated as individual frames.\n  -u/--tex-unite recompiles a temporary united TeX document and preserves SyncTeX.\n  --unite remains available as a compatibility alias.\n  -x/--pdfunite requires pdfunite on PATH and publishes no SyncTeX sidecar.\n  -X/--pdfunite-synctex keeps the pdfunite PDF and runs a temporary united TeX build to publish SyncTeX.\n  --clean or -c, when used alone, removes the entire faster-beamer cache.\n  [OUTPUT] is an optional positional alias for -o, --output FILE.";
 
 fn watch_label(input_file: &str) -> String {
     format!("Watch: monitoring {}", input_file)
@@ -97,12 +97,12 @@ fn main() {
             Arg::with_name("clean")
                 .short("c")
                 .long("clean")
-                .help("Remove faster-beamer cache, auxiliary files, and stale temporary files for the input"),
+                .help("Remove artifacts for INPUT, or the entire cache when used alone"),
         )
         .arg(
             Arg::with_name("INPUT")
                 .help("Input .tex file to compile")
-                .required(true)
+                .required_unless("clean")
                 .index(1),
         )
         .arg(
@@ -253,6 +253,24 @@ fn main() {
                 .index(2),
         )
         .get_matches();
+
+    if matches.is_present("clean") && matches.value_of("INPUT").is_none() {
+        let mut raw_args = env::args_os().skip(1);
+        let clean_is_only_argument = raw_args
+            .next()
+            .as_deref()
+            .map(|arg| arg == "--clean" || arg == "-c")
+            .unwrap_or(false)
+            && raw_args.next().is_none();
+        if !clean_is_only_argument {
+            error!("INPUT is required when --clean is combined with other arguments.");
+            std::process::exit(-1);
+        }
+        if process_file::clean_all_generated_artifacts().is_err() {
+            std::process::exit(-1);
+        }
+        return;
+    }
 
     let is_watch_mode = matches.is_present("watch");
     let input_file = matches.value_of("INPUT").unwrap().to_owned();

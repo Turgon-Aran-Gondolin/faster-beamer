@@ -1,3 +1,5 @@
+use crate::fs_utils::configured_cache_dir;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -32,7 +34,51 @@ struct GuardMetadata {
 }
 
 fn guard_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|dir| dir.join("faster-beamer").join("guards"))
+    configured_cache_dir().map(|dir| dir.join("guards"))
+}
+
+fn guard_listener_is_live(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok())
+        .unwrap_or(false)
+}
+
+fn has_live_guards_in(dir: &Path) -> std::io::Result<bool> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("guard")
+        {
+            continue;
+        }
+
+        let content = match fs::read_to_string(entry.path()) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if parse_metadata(&content)
+            .map(|metadata| guard_listener_is_live(&metadata.addr))
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn has_live_guards() -> std::io::Result<bool> {
+    match guard_dir() {
+        Some(dir) => has_live_guards_in(&dir),
+        None => Ok(false),
+    }
 }
 
 fn guard_metadata_path(input_path: &Path) -> Option<PathBuf> {

@@ -90,6 +90,13 @@ If you want to remove faster-beamer's cached outputs, published SyncTeX sidecar,
 faster-beamer presentation.tex --clean
 ```
 
+To remove every entry in the faster-beamer cache, use `--clean` or `-c` by itself:
+
+```bash
+faster-beamer --clean
+faster-beamer -c
+```
+
 If you want to compile independent frame PDFs concurrently, enable parallelization with `--parallel` or `-p`:
 
 ```bash

@@ -6,6 +6,13 @@ use std::path::{Component, Path, PathBuf, Prefix};
 #[cfg(windows)]
 use junction;
 
+pub fn configured_cache_dir() -> Option<PathBuf> {
+    std::env::var_os("FASTER_BEAMER_CACHE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::cache_dir().map(|path| path.join("faster-beamer")))
+}
+
 pub fn cache_relative_path(path: &Path) -> PathBuf {
     let mut relative = PathBuf::new();
     let mut saw_prefix = false;

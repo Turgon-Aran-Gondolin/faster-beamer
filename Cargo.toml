@@ -1,6 +1,6 @@
 [package]
 name = "faster-beamer"
-version = "0.1.11-dev"
+version = "0.1.12-dev"
 authors = ["Stephan Seitz <stephan.seitz@fau.de>"]
 edition = "2018"
 description = "An incremental compiler for LaTeX Beamer slides"
