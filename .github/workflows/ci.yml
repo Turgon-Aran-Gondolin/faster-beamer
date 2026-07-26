@@ -48,7 +48,7 @@ jobs:
       - name: Match tag to Cargo package version
         shell: bash
         run: |
-          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '\r')"
           expected_tag="v${package_version}"
 
           if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
@@ -56,10 +56,13 @@ jobs:
             exit 1
           fi
 
-          if [[ "${package_version}" == *-* ]]; then
-            echo "::error::Refusing to publish prerelease package version ${package_version}; the binary version embeds a commit hash."
-            exit 1
-          fi
+          case "${package_version}" in
+            *-dev|*-dev.*) ;;
+            *-*)
+              echo "::error::Only development prereleases are supported, not ${package_version}."
+              exit 1
+              ;;
+          esac
 
   build-release-binaries:
     name: Build release binary (${{ matrix.target }})
@@ -171,11 +174,26 @@ jobs:
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
+          release_title="${GITHUB_REF_NAME}"
+          release_args=()
+          case "${GITHUB_REF_NAME}" in
+            *-dev|*-dev.*)
+              release_title="${GITHUB_REF_NAME} (development release)"
+              release_args+=(--prerelease)
+              ;;
+          esac
+
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            if ((${#release_args[@]})); then
+              gh release edit "${GITHUB_REF_NAME}" \
+                --prerelease \
+                --title "${release_title}"
+            fi
             gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
           else
             gh release create "${GITHUB_REF_NAME}" dist/* \
               --generate-notes \
-              --title "${GITHUB_REF_NAME}" \
-              --verify-tag
+              --title "${release_title}" \
+              --verify-tag \
+              "${release_args[@]}"
           fi
